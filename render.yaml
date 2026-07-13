@@ -1,16 +1,12 @@
 services:
-  - type: web
-    name: car-service-bot
-    env: python
+  - type: worker
+    name: wash-and-scan-bot
+    runtime: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python app.py"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: RENDER_EXTERNAL_URL
+      - key: ADMIN_CHAT_ID
         sync: false
-      - key: OWNER_CHAT_ID
-        sync: false
-      - key: PYTHON_VERSION
-        value: 3.12.0
