@@ -1,805 +1,725 @@
-"""
-🚗 Car Service Tracker Bot — Render Production Version
-Compatible with Python 3.12+ (Up to 3.14)
-"""
-
-import logging
-import json
-import os
+import datetime
+import io
 import csv
-import asyncio
-from datetime import datetime
-from collections import defaultdict
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.error import TimedOut, RetryAfter, BadRequest
+import sqlite3
+from telebot import TeleBot, types
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# ==================== LOGGING ====================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+# --- Configuration & Initialization ---
+API_TOKEN = '8720346248:AAEfKYmJZqZRXs_t54siy7SHhmWRu3dp1LE'  # ضع هنا التوكن الخاص بالبوت
+ADMIN_CHAT_ID = 7579384719  # استبدله بـ ID حسابك الشخصي لاستلام الباك أب التلقائي
 
-# ==================== CONFIG ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATA_FILE = os.getenv("DATA_FILE", "orders.json")
-BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
+bot = TeleBot(API_TOKEN, parse_mode='Markdown')
 
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is required!")
+scheduler = BackgroundScheduler()
+scheduler.start()
 
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
-if not RENDER_EXTERNAL_URL:
-    raise ValueError("RENDER_EXTERNAL_URL environment variable is required! Example: https://carwashbott.onrender.com")
+DB_FILE = 'wash_and_scan.db'
 
-WEBHOOK_PATH = "/webhook"
-PORT = int(os.environ.get("PORT", 10000))
+# --- Database Initialization & Migration ---
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        
+        # 1. إنشاء جدول حالات المستخدمين الأساسي
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_states (
+                chat_id INTEGER PRIMARY KEY,
+                state TEXT DEFAULT 'main_menu',
+                pending_service TEXT,
+                pending_price INTEGER,
+                last_bot_msg_id INTEGER
+            )
+        ''')
+        
+        # التحديث التلقائي لجدول user_states: التحقق من وجود selected_cat_id وإضافته لو ناقص
+        cursor.execute("PRAGMA table_info(user_states)")
+        columns = [column[1] for column in cursor.fetchall()]
+        if 'selected_cat_id' not in columns:
+            cursor.execute("ALTER TABLE user_states ADD COLUMN selected_cat_id INTEGER")
+            print("⚙️ تم تحديث جدول user_states وإضافة العمود selected_cat_id بنجاح.")
+        
+        # 2. جدول الأقسام
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE,
+                icon TEXT
+            )
+        ''')
+        
+        # 3. جدول الخدمات والأسعار المربوط بالأقسام
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS services (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER,
+                name TEXT,
+                price INTEGER,
+                is_active INTEGER DEFAULT 1,
+                FOREIGN KEY(category_id) REFERENCES categories(id)
+            )
+        ''')
+        
+        # 4. جدول لتخزين الطلبات بالكامل
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                order_id_user INTEGER,
+                category_id INTEGER,
+                service TEXT,
+                price INTEGER,
+                time TEXT,
+                date TEXT
+            )
+        ''')
+        
+        # التحديث التلقائي لجدول orders: التحقق من وجود category_id وإضافته لو ناقص لتفادي الـ Exception
+        cursor.execute("PRAGMA table_info(orders)")
+        order_columns = [column[1] for column in cursor.fetchall()]
+        if 'category_id' not in order_columns:
+            cursor.execute("ALTER TABLE orders ADD COLUMN category_id INTEGER")
+            print("⚙️ تم تحديث جدول orders وإضافة العمود category_id بنجاح وحل المشكلة!")
+            
+        conn.commit()
+        
+        # ⚠️ قاعدة البيانات تبدأ فارغة تماماً (No Mock Data) لتقوم بإدخال أقسامك بنفسك من الإعدادات.
 
-os.makedirs(BACKUP_DIR, exist_ok=True)
+init_db()
 
-# Global background task registry to prevent Python garbage collection drops
-RUNNING_TASKS = set()
+# --- Helper Functions (Database Integrated) ---
 
-def run_safe_background_task(coro):
-    """Safely schedules a background task keeping a strong reference."""
-    task = asyncio.create_task(coro)
-    RUNNING_TASKS.add(task)
-    task.add_done_callback(RUNNING_TASKS.discard)
-    return task
-
-# ==================== SERVICES DATA ====================
-SERVICES = {
-    "wash": {
-        "label": "🚗 غسيل سيارات",
-        "items": {
-            "exterior":   {"name": "🚿 غسيل خارجي",      "price": 150},
-            "interior":   {"name": "🧹 غسيل داخلي",      "price": 200},
-            "full":       {"name": "✨ غسيل شامل",       "price": 300},
-            "polish":     {"name": "🪞 تلميع كامل",      "price": 500},
-            "engine":     {"name": "⚙️ غسيل محرك",       "price": 250},
+def get_user_state(chat_id):
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT state, pending_service, pending_price, last_bot_msg_id, selected_cat_id FROM user_states WHERE chat_id = ?", (chat_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            cursor.execute("INSERT INTO user_states (chat_id) VALUES (?)", (chat_id,))
+            conn.commit()
+            return {"state": "main_menu", "pending_order": None, "last_bot_msg_id": None, "selected_cat_id": None}
+        
+        pending_order = {"service": row[1], "price": row[2]} if row[1] else None
+        return {
+            "state": row[0],
+            "pending_order": pending_order,
+            "last_bot_msg_id": row[3],
+            "selected_cat_id": row[4]
         }
-    },
-    "diag": {
-        "label": "🔍 كشف أعطال",
-        "items": {
-            "computer":   {"name": "💻 كشف كمبيوتر",     "price": 100},
-            "mechanical": {"name": "🔧 كشف ميكانيكي",    "price": 150},
-            "electrical": {"name": "⚡ كشف كهرباء",      "price": 150},
-            "full_diag":  {"name": "🔍 كشف شامل",        "price": 300},
-            "pre_purchase":{"name": "🛡️ فحص قبل الشراء", "price": 400},
-        }
+
+def update_user_state(chat_id, state=None, pending_order=None, last_bot_msg_id=None, selected_cat_id=None, clear_pending=False):
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        if state:
+            cursor.execute("UPDATE user_states SET state = ? WHERE chat_id = ?", (state, chat_id))
+        if last_bot_msg_id is not None:
+            cursor.execute("UPDATE user_states SET last_bot_msg_id = ? WHERE chat_id = ?", (last_bot_msg_id, chat_id))
+        if selected_cat_id is not None:
+            cursor.execute("UPDATE user_states SET selected_cat_id = ? WHERE chat_id = ?", (selected_cat_id, chat_id))
+        if pending_order:
+            cursor.execute("UPDATE user_states SET pending_service = ?, pending_price = ? WHERE chat_id = ?", 
+                           (pending_order["service"], pending_order["price"], chat_id))
+        if clear_pending:
+            cursor.execute("UPDATE user_states SET pending_service = NULL, pending_price = NULL, selected_cat_id = NULL WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+
+def get_user_orders(chat_id):
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT order_id_user AS id, category_id, service, price, time, date FROM orders WHERE chat_id = ? ORDER BY id ASC", (chat_id,))
+        rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+
+def get_main_menu_markup():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, name, icon FROM categories")
+        cats = cursor.fetchall()
+        
+    buttons = []
+    for cat in cats:
+        buttons.append(types.InlineKeyboardButton(f"{cat[2]} {cat[1]}", callback_data=f"cat_show_{cat[0]}"))
+        
+    markup.add(*buttons)
+    
+    b3 = types.InlineKeyboardButton("📊 التقارير والإحصائيات", callback_data="menu_reports")
+    b4 = types.InlineKeyboardButton("💾 النسخ الاحتياطي والضبط", callback_data="backup_menu")
+    b5 = types.InlineKeyboardButton("🗑️ حذف آخر طلب", callback_data="confirm_delete")
+    
+    markup.add(b3, b4)
+    markup.add(b5)
+    return markup
+
+def get_reports_menu_markup():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    b1 = types.InlineKeyboardButton("📆 تقرير اليوم", callback_data="rep_today")
+    b2 = types.InlineKeyboardButton("📈 تقرير الشهر", callback_data="rep_month")
+    b3 = types.InlineKeyboardButton("📅 الشهور السابقة", callback_data="rep_all_months")
+    b4 = types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu")
+    
+    markup.add(b1, b2)
+    markup.add(b3)
+    markup.add(b4)
+    return markup
+
+def get_main_menu_text(chat_id):
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    orders = get_user_orders(chat_id)
+    today_orders = [o for o in orders if o["date"] == today_str]
+    
+    total_rev = sum(o["price"] for o in today_orders)
+    total_count = len(today_orders)
+    
+    text = f"📊 *نظرة عامة — اليوم*\n"
+    text += f"📅 {today_str}\n"
+    text += "━━━━━━━━━━━━━━━━━━\n"
+    text += f"💰 إجمالي الإيرادات: *{total_rev} ج*\n"
+    text += f"📦 عدد الطلبات: *{total_count}*\n\n"
+    
+    # 📝 ملخص الأقسام اليوم (ديناميكي تفاعلي بالكامل)
+    text += "📝 *ملخص الأقسام اليوم:*\n"
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT c.icon, c.name, COUNT(o.id), SUM(o.price)
+            FROM orders o
+            JOIN categories c ON o.category_id = c.id
+            WHERE o.chat_id = ? AND o.date = ?
+            GROUP BY c.id
+        """, (chat_id, today_str))
+        cat_summary = cursor.fetchall()
+        
+    if not cat_summary:
+        text += "  لا توجد مبيعات في الأقسام اليوم بعد.\n\n"
+    else:
+        for row in cat_summary:
+            text += f"  {row[0]} {row[1]} — عدد {row[2]} — *{row[3]} ج*\n"
+        text += "\n"
+        
+    text += "🕐 *آخر 5 تسجيلات:*\n"
+    if not orders:
+        text += "  مفيش تسجيلات\n"
+    else:
+        for o in orders[-5:][::-1]:
+            text += f"  `#{o['id']}` {o['service']} — *{o['price']}ج* ({o['date']})\n"
+            
+    text += "\n📌 *اختار الإجراء أو القسم:*"
+    return text
+
+def record_order(chat_id, category_id, service, price):
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT COUNT(*) FROM orders WHERE chat_id = ?", (chat_id,))
+        count = cursor.fetchone()[0]
+        next_order_id = count + 1
+        
+        now_time = datetime.datetime.now().strftime("%H:%M")
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        
+        cursor.execute('''
+            INSERT INTO orders (chat_id, order_id_user, category_id, service, price, time, date)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (chat_id, next_order_id, category_id, service, int(price), now_time, today_str))
+        conn.commit()
+    
+    update_user_state(chat_id, state="main_menu", clear_pending=True)
+    return {
+        "id": next_order_id,
+        "service": service,
+        "price": int(price),
+        "time": now_time,
+        "date": today_str
     }
-}
 
-# ==================== DATA LAYER ====================
-class OrderStore:
-    @staticmethod
-    def load():
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return []
+def auto_return_to_main(chat_id, message_id):
+    try:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=get_main_menu_text(chat_id),
+            reply_markup=get_main_menu_markup()
+        )
+    except Exception:
+        pass
 
-    @staticmethod
-    def save(orders):
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(orders, f, ensure_ascii=False, indent=2)
-
-    @staticmethod
-    def add(service_key, service_name, price):
-        orders = OrderStore.load()
-        order = {
-            "id": len(orders) + 1,
-            "service_key": service_key,
-            "service_name": service_name,
-            "price": price,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "date": datetime.now().strftime("%Y-%m-%d"),
-            "month": datetime.now().strftime("%Y-%m"),
-        }
-        orders.append(order)
-        OrderStore.save(orders)
-        return order
-
-    @staticmethod
-    def pop_last():
-        orders = OrderStore.load()
-        if orders:
-            deleted = orders.pop()
-            OrderStore.save(orders)
-            return deleted
-        return None
-
-    @staticmethod
-    def filter_by_date(date_str):
-        return [o for o in OrderStore.load() if o["date"] == date_str]
-
-    @staticmethod
-    def filter_by_month(month_str):
-        return [o for o in OrderStore.load() if o["month"] == month_str]
-
-    @staticmethod
-    def last_n(n=5):
-        orders = OrderStore.load()
-        return orders[-n:][::-1]
-
-    @staticmethod
-    def monthly_summary():
-        monthly = defaultdict(lambda: {"total": 0, "count": 0})
-        for o in OrderStore.load():
-            monthly[o["month"]]["total"] += o["price"]
-            monthly[o["month"]]["count"] += 1
-        return dict(sorted(monthly.items(), reverse=True))
-
-
-# ==================== BACKUP SYSTEM ====================
-class BackupManager:
-    @staticmethod
-    def export_csv(filepath=None):
-        orders = OrderStore.load()
-        if not orders:
-            return None
-        if filepath is None:
-            date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filepath = os.path.join(BACKUP_DIR, f"backup_{date_str}.csv")
-        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(["ID", "Service Key", "Service Name", "Price", "Date", "Time", "Month"])
-            for o in orders:
-                writer.writerow([
-                    o["id"], o["service_key"], o["service_name"],
-                    o["price"], o["date"], o["timestamp"][11:16], o["month"]
-                ])
-        return filepath
-
-    @staticmethod
-    def list_backups():
-        if not os.path.exists(BACKUP_DIR):
-            return []
-        files = [f for f in os.listdir(BACKUP_DIR) if f.endswith(".csv")]
-        return sorted(files, reverse=True)
-
-    @staticmethod
-    def restore_from_csv(filepath):
-        if not os.path.exists(filepath):
-            return False, "ملف غير موجود"
+def price_timeout_handler(chat_id, message_id, category_id):
+    data = get_user_state(chat_id)
+    if data["state"] == "awaiting_price" and data["pending_order"] and data["last_bot_msg_id"] == message_id:
+        po = data["pending_order"]
+        order = record_order(chat_id, category_id, po["service"], po["price"])
+        
+        text = f"✅ *تم التسجيل تلقائياً #{order['id']}*\n\n"
+        text += f"🛠️ {order['service']}\n"
+        text += f"💰 {order['price']}ج\n"
+        text += f"🕐 {order['time']}\n\n"
+        text += "⏳ رجوع تلقائي للقائمة..."
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
+        
         try:
-            orders = []
-            with open(filepath, "r", encoding="utf-8-sig") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    orders.append({
-                        "id": int(row["ID"]),
-                        "service_key": row["Service Key"],
-                        "service_name": row["Service Name"],
-                        "price": int(row["Price"]),
-                        "timestamp": f"{row['Date']} {row['Time']}:00",
-                        "date": row["Date"],
-                        "month": row["Month"],
-                    })
-            OrderStore.save(orders)
-            return True, f"تم استرجاع {len(orders)} طلب"
-        except Exception as e:
-            return False, f"خطأ: {str(e)}"
+            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup)
+            scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, message_id])
+        except Exception:
+            pass
 
-    @staticmethod
-    def cleanup_old_backups(keep=30):
-        backups = BackupManager.list_backups()
-        for old in backups[keep:]:
-            os.remove(os.path.join(BACKUP_DIR, old))
+def normalize_date(date_str):
+    date_str = date_str.strip().replace('/', '-')
+    formats = ('%Y-%m-%d', '%d-%m-%Y', '%d-%m-%y')
+    for fmt in formats:
+        try:
+            return datetime.datetime.strptime(date_str, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return date_str
 
+# --- نظام الباك أب التلقائي اليومي الشامل ---
+def auto_daily_backup():
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    csv_buffer = io.StringIO()
+    csv_buffer.write('\ufeff')
+    writer = csv.writer(csv_buffer)
+    writer.writerow(["رقم الطلب", "نوع الخدمة", "السعر", "الوقت", "التاريخ"])
+    
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT order_id_user, service, price, time, date FROM orders")
+        all_orders = cursor.fetchall()
+    
+    total_day_rev = 0
+    total_day_orders = 0
+    
+    for row in all_orders:
+        writer.writerow(row)
+        if row[4] == today_str:
+            total_day_rev += row[2]
+            total_day_orders += 1
+    
+    csv_buffer.seek(0)
+    bio = io.BytesIO(csv_buffer.getvalue().encode('utf-8'))
+    bio.name = f"قاعدة_البيانات_الكاملة_تاريخ_{today_str}.csv"
+    
+    try:
+        report_text = f"🤖 *تقرير النسخ الاحتياطي التلقائي من SQLite*\n"
+        report_text += f"📅 تاريخ اليوم: `{today_str}`\n"
+        report_text += "━━━━━━━━━━━━━━━━━━\n"
+        report_text += f"💰 إجمالي إيراد اليوم: *{total_day_rev} ج*\n"
+        report_text += f"📦 إجمالي عدد طلبات اليوم: *{total_day_orders}*\n\n"
+        report_text += "📂 مرفق ملف الباك أب الشامل لقاعدة البيانات لضمان عدم ضياع أي سجلات."
+        
+        bot.send_document(ADMIN_CHAT_ID, bio, caption=report_text)
+    except Exception as e:
+        print(f"Failed to send automated backup: {e}")
 
-# ==================== UI BUILDERS ====================
-class UI:
-    @staticmethod
-    def button(text, callback):
-        return InlineKeyboardButton(text, callback_data=callback)
+scheduler.add_job(auto_daily_backup, 'cron', hour=23, minute=59)
 
-    @staticmethod
-    def back_button():
-        return [UI.button("🔙 رجوع", "back_main")]
+# --- Command Handlers ---
+@bot.message_handler(commands=['start'])
+def start_cmd(message):
+    chat_id = message.chat.id
+    update_user_state(chat_id, state="main_menu", clear_pending=True, last_bot_msg_id=0)
+    bot.send_message(chat_id, get_main_menu_text(chat_id), reply_markup=get_main_menu_markup())
 
-    @staticmethod
-    def service_menu(category):
-        cat = SERVICES[category]
-        buttons = [
-            [UI.button(f"{v['name']} — {v['price']}ج", f"order_{category}_{k}")]
-            for k, v in cat["items"].items()
-        ]
-        buttons.append(UI.back_button())
-        return InlineKeyboardMarkup(buttons)
+# --- Callback Query Handlers ---
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callbacks(call):
+    chat_id = call.message.chat.id
+    msg_id = call.message.message_id
+    data = get_user_state(chat_id)
+    
+    if call.data == "main_menu":
+        update_user_state(chat_id, state="main_menu", clear_pending=True)
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=get_main_menu_text(chat_id), reply_markup=get_main_menu_markup())
 
-    @staticmethod
-    def main_menu():
-        return InlineKeyboardMarkup([
-            [UI.button(SERVICES["wash"]["label"], "menu_wash"),
-             UI.button(SERVICES["diag"]["label"], "menu_diag")],
-            [UI.button("🗑️ حذف آخر طلب", "delete_confirm")],
-            [UI.button("📊 تقرير اليوم", "report_today"),
-             UI.button("📈 تقرير الشهر", "report_month")],
-            [UI.button("📅 تقرير شهري", "report_monthly")],
-            [UI.button("💾 باك اب", "backup_menu")],
-        ])
+    elif call.data == "menu_reports":
+        update_user_state(chat_id, state="reports_menu")
+        text = "📊 *مطبخ التقارير والإحصائيات*\n\nاختار نوع التقرير المطلوب استعراضه:"
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=get_reports_menu_markup())
 
-    @staticmethod
-    def back_only():
-        return InlineKeyboardMarkup([UI.back_button()])
+    elif call.data.startswith("cat_show_"):
+        cat_id = int(call.data.split("_")[2])
+        update_user_state(chat_id, state="service_list", selected_cat_id=cat_id)
+        
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
+            cat_info = cursor.fetchone()
+            cursor.execute("SELECT name, price FROM services WHERE category_id = ? AND is_active = 1", (cat_id,))
+            services = cursor.fetchall()
+            
+        title = f"{cat_info[1]} {cat_info[0]}"
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        
+        for srv in services:
+            markup.add(types.InlineKeyboardButton(f"{srv[0]} — {srv[1]}ج", callback_data=f"srv_{srv[0]}_{srv[1]}"))
+            
+        markup.add(types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"📍 قسم: *{title}*\n\nاضغط لتسجيل الإجراء مباشرة:", reply_markup=markup)
 
-    @staticmethod
-    def confirm_delete():
-        return InlineKeyboardMarkup([
-            [UI.button("✅ نعم، احذف", "delete_last")],
-            [UI.button("❌ لا، تراجع", "back_main")]
-        ])
+    elif call.data.startswith("srv_"):
+        parts = call.data.split("_")
+        service_name = parts[1]
+        default_price = int(parts[2])
+        cat_id = data["selected_cat_id"]
+        
+        update_user_state(chat_id, state="awaiting_price", pending_order={"service": service_name, "price": default_price}, last_bot_msg_id=msg_id)
+        
+        text = f"💰 *تأكيد السعر*\n\n"
+        text += f"🛠️ {service_name}\n"
+        text += f"السعر الافتراضي: *{default_price}ج*\n\n"
+        text += "✅ اضغط تأكيد أو اكتب سعر جديد في الشات خلال 10 ثواني..."
+        
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton(f"✅ تأكيد ({default_price}ج)", callback_data="confirm_default"),
+            types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")
+        )
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+        scheduler.add_job(price_timeout_handler, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=10), args=[chat_id, msg_id, cat_id])
 
-    @staticmethod
-    def confirm_price(service_name, default_price):
-        return InlineKeyboardMarkup([
-            [UI.button(f"✅ تأكيد ({default_price}ج)", "confirm_default_price")],
-            UI.back_button()
-        ])
+    elif call.data == "confirm_default":
+        if data["state"] == "awaiting_price" and data["pending_order"]:
+            po = data["pending_order"]
+            cat_id = data["selected_cat_id"]
+            order = record_order(chat_id, cat_id, po["service"], po["price"])
+            
+            text = f"✅ *تم التسجيل #{order['id']}*\n\n"
+            text += f"🛠️ {order['service']}\n"
+            text += f"💰 {order['price']}ج\n"
+            text += f"🕐 {order['time']}\n\n"
+            text += "⏳ رجوع تلقائي للقائمة..."
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
+            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+            scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
 
-    @staticmethod
-    def backup_menu():
-        return InlineKeyboardMarkup([
-            [UI.button("📤 تصدير CSV", "backup_export")],
-            [UI.button("📥 استرجاع باك اب", "backup_restore_list")],
-            UI.back_button()
-        ])
+    elif call.data == "backup_menu":
+        text = "💾 *إدارة النسخ الاحتياطي والضبط*\n\nتحكم بالبيانات المخزنة أو توجه إلى لوحة التحكم بالأقسام والأسعار:"
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton("⚙️ إعدادات الأقسام والأسعار", callback_data="settings_main"),
+            types.InlineKeyboardButton("➕ إنشاء قسم جديد تماماً", callback_data="add_category_trigger"),
+            types.InlineKeyboardButton("📤 تحميل البيانات فورا (CSV)", callback_data="export_csv"),
+            types.InlineKeyboardButton("📥 استعادة البيانات (رفع CSV)", callback_data="import_csv_trigger"),
+            types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu")
+        )
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
-    @staticmethod
-    def backup_list():
-        backups = BackupManager.list_backups()
-        if not backups:
-            return InlineKeyboardMarkup([
-                [UI.button("📝 مفيش باك اب", "backup_menu")],
-                UI.back_button()
-            ])
-        buttons = []
-        for b in backups[:10]:
-            date_part = b.replace("backup_", "").replace(".csv", "")
-            display = f"📄 {date_part[:4]}-{date_part[4:6]}-{date_part[6:8]} {date_part[9:11]}:{date_part[11:13]}"
-            buttons.append([UI.button(display, f"restore_{b}")])
-        buttons.append(UI.back_button())
-        return InlineKeyboardMarkup(buttons)
+    elif call.data == "settings_main":
+        text = "⚙️ *لوحة تحكم الأقسام والخدمات*\n\nاختار القسم لتعديل أسعاره أو إضافة خدمة جديدة داخله:"
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name, icon FROM categories")
+            cats = cursor.fetchall()
+            
+        for cat in cats:
+            markup.add(types.InlineKeyboardButton(f"إدارة: {cat[2]} {cat[1]}", callback_data=f"setcat_{cat[0]}"))
+            
+        markup.add(types.InlineKeyboardButton("🔙 رجوع للخلف", callback_data="backup_menu"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
-    @staticmethod
-    def confirm_restore(filename):
-        return InlineKeyboardMarkup([
-            [UI.button("✅ نعم، استرجع", f"confirm_restore_{filename}")],
-            [UI.button("❌ لا، تراجع", "backup_restore_list")]
-        ])
+    elif call.data == "add_category_trigger":
+        update_user_state(chat_id, state="awaiting_new_category", last_bot_msg_id=msg_id)
+        text = "➕ *إنشاء قسم جديد*\n\nاكتب اسم القسم والـ emoji المفضل في رسالة واحدة مثل هذا المثال:\n\n`غسيل سيارات — 🚗`"
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="backup_menu"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
+    elif call.data.startswith("setcat_"):
+        cat_id = int(call.data.split("_")[1])
+        update_user_state(chat_id, selected_cat_id=cat_id)
+        
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
+            cat_info = cursor.fetchone()
+            cursor.execute("SELECT id, name, price FROM services WHERE category_id = ? AND is_active = 1", (cat_id,))
+            services = cursor.fetchall()
+            
+        text = f"⚙️ *تعديل قسم: {cat_info[1]} {cat_info[0]}*\n\n"
+        text += "الخدمات الحالية المسجلة:\n"
+        if not services:
+            text += "  لا توجد خدمات في هذا القسم بعد.\n"
+        for s in services:
+            text += f"• {s[1]} — {s[2]}ج\n"
+            
+        text += "\n➕ لإضافة خدمة جديدة لهذا القسم اضغط على الزر بالأسفل."
+        
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton("➕ إضافة خدمة / إجراء جديد", callback_data="add_service_trigger"),
+            types.InlineKeyboardButton("🔙 رجوع للضبط", callback_data="settings_main")
+        )
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
-# ==================== REPORT BUILDERS ====================
-class Reports:
-    @staticmethod
-    def header(title, subtitle=""):
-        line = "━" * 18
-        if subtitle:
-            return title + "\n" + subtitle + line + "\n"
-        return title + "\n" + line + "\n"
+    elif call.data == "add_service_trigger":
+        update_user_state(chat_id, state="awaiting_new_service_name", last_bot_msg_id=msg_id)
+        text = "✍️ *إضافة خدمة جديدة*\n\nاكتب اسم الخدمة والسعر في رسالة واحدة بالشات بهذا الشكل تماماً:\n\n`غسيل شامل — 300`\n\n⚠️ تأكد من وضع الشرطة المائلة `—` بين الاسم والسعر."
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="settings_main"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
-    @staticmethod
-    def order_line(order):
-        time_str = order["timestamp"][11:16]
-        return "  `#" + str(order['id']) + "` " + order['service_name'] + " — *" + str(order['price']) + "ج* (" + time_str + ")\n"
+    elif call.data == "rep_today":
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        orders = get_user_orders(chat_id)
+        today_orders = [o for o in orders if o["date"] == today_str]
+        total_rev = sum(o["price"] for o in today_orders)
+        
+        text = f"📆 *تقرير اليوم بالتفصيل*\n"
+        text += f"📅 {today_str}\n"
+        text += "━━━━━━━━━━━━━━━━━━\n"
+        text += f"💰 الإجمالي: *{total_rev} ج*\n"
+        text += f"📦 الطلبات: *{len(today_orders)}*\n\n"
+        text += "📝 *التفاصيل:*\n"
+        
+        if not today_orders:
+            text += "  مفيش طلبات مسجلة اليوم حتى الآن."
+        else:
+            for o in today_orders:
+                text += f"  `#{o['id']}` {o['service']} — *{o['price']}ج* ({o['time']})\n"
+                
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 رجوع للتقارير", callback_data="menu_reports"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
-    @staticmethod
-    def category_summary(orders):
-        summary = defaultdict(lambda: {"count": 0, "total": 0})
+    elif call.data == "rep_month":
+        current_month = datetime.date.today().strftime("%Y-%m")
+        orders = get_user_orders(chat_id)
+        month_orders = [o for o in orders if o["date"].startswith(current_month)]
+        total_rev = sum(o["price"] for o in month_orders)
+        
+        text = f"📈 *تقرير إحصائيات الشهر الحالي*\n"
+        text += f"📅 {current_month}\n"
+        text += "━━━━━━━━━━━━━━━━━━\n"
+        text += f"💰 إجمالي الإيرادات: *{total_rev} ج*\n"
+        text += f"📦 إجمالي الطلبات: *{len(month_orders)}*\n\n"
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 رجوع للتقارير", callback_data="menu_reports"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+
+    elif call.data == "rep_all_months":
+        text = f"📅 *الملخص السنوي / الشهور السابقة*\n"
+        text += "━━━━━━━━━━━━━━━━━━\n"
+        orders = get_user_orders(chat_id)
+        monthly_summaries = {}
         for o in orders:
-            cat_key = o["service_key"].split("_")[0]
-            summary[cat_key]["count"] += 1
-            summary[cat_key]["total"] += o["price"]
-        return summary
-
-    @staticmethod
-    def overview():
-        today = datetime.now().strftime("%Y-%m-%d")
-        today_orders = OrderStore.filter_by_date(today)
-        total = sum(o["price"] for o in today_orders)
-        count = len(today_orders)
-        last_orders = OrderStore.last_n(5)
-
-        text = Reports.header("📊 *نظرة عامة — اليوم*", "📅 " + today + "\n")
-        text += "💰 إجمالي الإيرادات: *" + str(total) + " ج*\n"
-        text += "📦 عدد الطلبات: *" + str(count) + "*\n\n"
-
-        cat_summary = Reports.category_summary(today_orders)
-        if cat_summary:
-            for cat_key, stats in cat_summary.items():
-                label = SERVICES.get(cat_key, {}).get("label", cat_key)
-                text += label + "\n"
-                text += "  📦 " + str(stats['count']) + " عدد | 💰 " + str(stats['total']) + " ج\n\n"
+            month_key = o["date"][:7]
+            monthly_summaries[month_key] = monthly_summaries.get(month_key, 0) + o["price"]
+            
+        if not monthly_summaries:
+            text += "لا يوجد مبيعات مؤرشفة لشهور سابقة بعد."
         else:
-            text += "📭 مفيش طلبات النهاردة\n\n"
+            for m_key, m_total in sorted(monthly_summaries.items(), reverse=True):
+                text += f"📅 شهر *{m_key}* — إجمالي الإيراد: *{m_total} ج*\n"
+                
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 رجوع للتقارير", callback_data="menu_reports"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
-        text += "🕐 *آخر 5 تسجيلات:*\n"
-        if last_orders:
-            for o in last_orders:
-                text += Reports.order_line(o)
-        else:
-            text += "  مفيش تسجيلات\n"
-
-        text += "\n📌 *اختار:*"
-        return text
-
-    @staticmethod
-    def daily():
-        today = datetime.now().strftime("%Y-%m-%d")
-        orders = OrderStore.filter_by_date(today)
-        total = sum(o["price"] for o in orders)
-        text = Reports.header("📊 *تقرير اليوم*", "📅 " + today + "\n")
-        text += "💰 الإجمالي: *" + str(total) + " ج*\n"
-        text += "📦 الطلبات: *" + str(len(orders)) + "*\n\n"
-        if orders:
-            text += "📝 *التفاصيل:*\n"
-            for o in orders:
-                text += Reports.order_line(o)
-        else:
-            text += "📝 مفيش طلبات"
-        return text
-
-    @staticmethod
-    def monthly():
-        month = datetime.now().strftime("%Y-%m")
-        orders = OrderStore.filter_by_month(month)
-        total = sum(o["price"] for o in orders)
-        text = Reports.header("📈 *تقرير الشهر: " + month + "*", "")
-        text += "💰 الإجمالي: *" + str(total) + " ج*\n"
-        text += "📦 الطلبات: *" + str(len(orders)) + "*\n\n"
-        if orders:
-            text += "📝 *آخر 10 طلبات:*\n"
-            for o in orders[-10:][::-1]:
-                text += "  `#" + str(o['id']) + "` " + o['service_name'] + " — " + str(o['price']) + "ج (" + o['date'] + ")\n"
-        else:
-            text += "📝 مفيش طلبات"
-        return text
-
-    @staticmethod
-    def all_months():
-        monthly = OrderStore.monthly_summary()
-        text = Reports.header("📅 *التقرير الشهري*", "إجمالي الإيرادات لكل شهر:\n")
-        if monthly:
-            grand_total = sum(v["total"] for v in monthly.values())
-            grand_count = sum(v["count"] for v in monthly.values())
-            for month, stats in monthly.items():
-                text += "📆 `" + month + "`: *" + str(stats['total']) + "ج* (" + str(stats['count']) + " طلب)\n"
-            text += "━" * 18 + "\n"
-            text += "💰 الإجمالي الكلي: *" + str(grand_total) + "ج*\n"
-            text += "📦 إجمالي الطلبات: *" + str(grand_count) + "*"
-        else:
-            text += "📝 مفيش بيانات"
-        return text
-
-    @staticmethod
-    def confirmation(order, action="تم التسجيل"):
-        return (
-            "✅ *" + action + " #" + str(order['id']) + "*\n\n"
-            "🛠️ " + order['service_name'] + "\n"
-            "💰 " + str(order['price']) + "ج\n"
-            "🕐 " + datetime.now().strftime('%H:%M') + "\n\n"
-            "⏳ رجوع تلقائي للقائمة بعد 2 ثانية..."
-        )
-
-    @staticmethod
-    def price_prompt(service_name, default_price):
-        return (
-            "💰 *تأكيد السعر*\n\n"
-            "🛠️ " + service_name + "\n"
-            "السعر الافتراضي: *" + str(default_price) + "ج*\n\n"
-            "✅ اضغط تأكيد أو اكتب سعر جديد خلال 10 ثواني..."
-        )
-
-    @staticmethod
-    def delete_confirmation_preview():
-        orders = OrderStore.load()
+    elif call.data == "confirm_delete":
+        orders = get_user_orders(chat_id)
         if not orders:
-            return "🗑️ *تأكيد الحذف*\n\nمفيش طلبات للحذف"
-        last = orders[-1]
-        return (
-            "🗑️ *تأكيد الحذف*\n\n"
-            "هل أنت متأكد من حذف آخر طلب؟\n\n"
-            "`#" + str(last['id']) + "` " + last['service_name'] + "\n"
-            "💰 " + str(last['price']) + "ج — " + last['date'] + " " + last['timestamp'][11:16]
+            bot.answer_callback_query(call.id, "مفيش طلبات عشان تحذفها!", show_alert=True)
+            return
+        
+        last_order = orders[-1]
+        text = f"🗑️ *تأكيد الحذف*\n\nهل أنت متأكد من حذف آخر طلب؟\n\n`#{last_order['id']}` {last_order['service']} — *{last_order['price']}ج*"
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("⚠️ نعم، احذف", callback_data="delete_execute"),
+            types.InlineKeyboardButton("❌ لا، تراجع", callback_data="main_menu")
         )
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
+    elif call.data == "delete_execute":
+        orders = get_user_orders(chat_id)
+        if orders:
+            last_order = orders[-1]
+            with sqlite3.connect(DB_FILE) as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM orders WHERE chat_id = ? AND order_id_user = ?", (chat_id, last_order["id"]))
+                conn.commit()
+            
+            text = "🗑️ تم الحذف بنجاح... رجوع تلقائي"
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
+            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+            scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
 
-# ==================== SAFE API HELPERS ====================
-async def safe_edit_message(context, chat_id, message_id, text, markup, max_retries=3):
-    for attempt in range(max_retries):
+    elif call.data == "export_csv":
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        orders = get_user_orders(chat_id)
+        csv_buffer = io.StringIO()
+        csv_buffer.write('\ufeff')
+        writer = csv.writer(csv_buffer)
+        writer.writerow(["رقم الطلب", "نوع الخدمة", "السعر", "الوقت", "التاريخ"])
+        for o in orders:
+            writer.writerow([o["id"], o["service"], o["price"], o["time"], o["date"]])
+        csv_buffer.seek(0)
+        bio = io.BytesIO(csv_buffer.getvalue().encode('utf-8'))
+        bio.name = f"تقرير_الشغل_{chat_id}_{today_str}.csv"
         try:
-            await context.bot.edit_message_text(
-                text, chat_id=chat_id, message_id=message_id,
-                parse_mode="Markdown", reply_markup=markup,
-                read_timeout=30, write_timeout=30, connect_timeout=30,
-            )
-            return True
-        except TimedOut:
-            logger.warning(f"TimedOut edit (attempt {attempt + 1}/{max_retries})")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)
-            else:
-                raise
-        except RetryAfter as e:
-            logger.warning(f"Rate limited, retrying after {e.retry_after}s")
-            await asyncio.sleep(e.retry_after)
-            return await safe_edit_message(context, chat_id, message_id, text, markup, max_retries=1)
-        except BadRequest as e:
-            if "message is not modified" in str(e).lower():
-                return True
-            raise
-    return False
+            bot.send_document(chat_id, bio, caption="📤 تم سحب النسخة بنجاح.")
+        except Exception:
+            pass
+
+    elif call.data == "import_csv_trigger":
+        update_user_state(chat_id, state="awaiting_restore_file", last_bot_msg_id=msg_id)
+        text = "📥 قم بإرسال ملف الـ CSV لاستعادة البيانات الحالية واستبدالها..."
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="backup_menu"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
 
-async def safe_edit_callback(query, text, markup, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
-            return True
-        except TimedOut:
-            logger.warning(f"TimedOut callback (attempt {attempt + 1}/{max_retries})")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)
-            else:
-                raise
-        except RetryAfter as e:
-            logger.warning(f"Rate limited, retrying after {e.retry_after}s")
-            await asyncio.sleep(e.retry_after)
-            return await safe_edit_callback(query, text, markup, max_retries=1)
-        except BadRequest as e:
-            if "message is not modified" in str(e).lower():
-                return True
-            raise
-    return False
-
-
-async def safe_send_document(context, chat_id, filepath, caption="", max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            with open(filepath, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=chat_id, document=f, caption=caption,
-                    read_timeout=60, write_timeout=60, connect_timeout=30,
-                )
-            return True
-        except TimedOut:
-            logger.warning(f"TimedOut sending doc (attempt {attempt + 1}/{max_retries})")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)
-        except RetryAfter as e:
-            logger.warning(f"Rate limited, retrying after {e.retry_after}s")
-            await asyncio.sleep(e.retry_after)
-            return await safe_send_document(context, chat_id, filepath, caption, max_retries=1)
-    return False
-
-
-# ==================== CLEAN CHAT HELPERS ====================
-async def ensure_single_master_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, markup):
-    chat_id = update.effective_chat.id
-    master_msg_id = context.user_data.get("master_msg_id")
-
-    if master_msg_id:
-        try:
-            if update.callback_query:
-                await safe_edit_callback(update.callback_query, text, markup)
-            else:
-                await safe_edit_message(context, chat_id, master_msg_id, text, markup)
-            return master_msg_id
-        except Exception as e:
-            logger.warning(f"Could not edit master msg {master_msg_id}: {e}")
-            context.user_data.pop("master_msg_id", None)
-
-    try:
-        if update.message:
-            msg = await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+# --- Message Handling ---
+@bot.message_handler(content_types=['text', 'document'])
+def handle_all_messages(message):
+    chat_id = message.chat.id
+    data = get_user_state(chat_id)
+    target_msg_id = data["last_bot_msg_id"]
+    
+    # [1] استقبال اسم القسم الجديد والـ Emoji
+    if data["state"] == "awaiting_new_category" and message.content_type == 'text':
+        text_received = message.text.strip()
+        try: bot.delete_message(chat_id, message.message_id)
+        except Exception: pass
+        
+        if "—" in text_received:
+            try:
+                cat_name, cat_icon = text_received.split("—")
+                cat_name = cat_name.strip()
+                cat_icon = cat_icon.strip()
+                
+                with sqlite3.connect(DB_FILE) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("INSERT INTO categories (name, icon) VALUES (?, ?)", (cat_name, cat_icon))
+                    conn.commit()
+                text = f"✅ *تم إنشاء القسم الجديد بنجاح!*\n\n📂 القسم: {cat_icon} {cat_name}\n📌 يمكنك الآن التوجه للإعدادات وإضافة خدمات له."
+            except Exception as e:
+                text = f"❌ حدث خطأ، يرجى التأكد من عدم تكرار اسم القسم.\n`{str(e)}`"
         else:
-            msg = await context.bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
-        context.user_data["master_msg_id"] = msg.message_id
-        return msg.message_id
-    except Exception as e:
-        logger.error(f"Failed to send new message: {e}")
-        raise
-
-
-async def auto_return_to_main(context: ContextTypes.DEFAULT_TYPE, chat_id: int, master_msg_id: int, delay: int = 2):
-    await asyncio.sleep(delay)
-    try:
-        text = Reports.overview()
-        markup = UI.main_menu()
-        await safe_edit_message(context, chat_id, master_msg_id, text, markup)
-    except Exception as e:
-        logger.warning(f"Auto-return failed: {e}")
-
-
-# ==================== PRICE CONFIRMATION FLOW ====================
-async def start_price_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, category: str, key: str):
-    service = SERVICES[category]["items"][key]
-    service_name = service["name"]
-    default_price = service["price"]
-
-    context.user_data["pending_order"] = {
-        "category": category,
-        "key": key,
-        "service_name": service_name,
-        "default_price": default_price,
-    }
-    context.user_data["awaiting_price"] = True
-
-    text = Reports.price_prompt(service_name, default_price)
-    master_msg_id = await ensure_single_master_message(update, context, text, UI.confirm_price(service_name, default_price))
-
-    chat_id = update.effective_chat.id
-    run_safe_background_task(_price_timeout(context, chat_id, master_msg_id))
-
-
-async def _price_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, master_msg_id: int):
-    await asyncio.sleep(10)
-
-    if not context.user_data.get("awaiting_price"):
+            text = "❌ صيغة غير صحيحة. اكتبها كالتالي: `غسيل سيارات — 🚗`"
+            
+        update_user_state(chat_id, state="main_menu")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⚙️ إعدادات الأقسام والأسعار", callback_data="settings_main"))
+        bot.send_message(chat_id, text, reply_markup=markup)
         return
 
-    pending = context.user_data.get("pending_order")
-    if not pending:
-        return
-
-    category = pending["category"]
-    key = pending["key"]
-    service_name = pending["service_name"]
-    default_price = pending["default_price"]
-
-    context.user_data.pop("awaiting_price", None)
-    context.user_data.pop("pending_order", None)
-
-    order = OrderStore.add(f"{category}_{key}", service_name, default_price)
-    text = Reports.confirmation(order)
-
-    try:
-        await safe_edit_message(context, chat_id, master_msg_id, text, UI.back_only())
-        run_safe_background_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
-    except Exception as e:
-        logger.warning(f"Auto-confirm failed: {e}")
-
-
-async def handle_price_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("awaiting_price"):
-        return False
-
-    text = update.message.text.strip()
-    chat_id = update.message.chat_id
-    master_msg_id = context.user_data.get("master_msg_id")
-
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=update.message.message_id)
-    except:
-        pass
-
-    pending = context.user_data.get("pending_order")
-    if not pending:
-        return True
-
-    category = pending["category"]
-    key = pending["key"]
-    service_name = pending["service_name"]
-
-    try:
-        new_price = int(text)
-        if new_price <= 0:
-            raise ValueError("Price must be positive")
-    except ValueError:
-        if master_msg_id:
-            error_text = (
-                "❌ *سعر غير صحيح*\n\n"
-                "اكتب رقم صحيح أو اضغط تأكيد\n\n"
-                "🛠️ " + service_name + "\n"
-                "السعر: *" + str(pending['default_price']) + "ج*"
-            )
-            await safe_edit_message(context, chat_id, master_msg_id, error_text, UI.confirm_price(service_name, pending['default_price']))
-        return True
-
-    context.user_data.pop("awaiting_price", None)
-    context.user_data.pop("pending_order", None)
-
-    order = OrderStore.add(f"{category}_{key}", service_name, new_price)
-    text = Reports.confirmation(order)
-
-    if master_msg_id:
-        await safe_edit_message(context, chat_id, master_msg_id, text, UI.back_only())
-        run_safe_background_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
-
-    return True
-
-
-# ==================== HANDLERS ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = Reports.overview()
-    markup = UI.main_menu()
-    await ensure_single_master_message(update, context, text, markup)
-
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception as e:
-        logger.warning(f"Failed to answer callback: {e}")
-
-    data = query.data
-    chat_id = query.message.chat_id
-
-    if data == "back_main":
-        context.user_data.pop("awaiting_price", None)
-        context.user_data.pop("pending_order", None)
-        return await start(update, context)
-
-    if data == "confirm_default_price":
-        pending = context.user_data.get("pending_order")
-        if pending:
-            context.user_data.pop("awaiting_price", None)
-            category = pending["category"]
-            key = pending["key"]
-            service_name = pending["service_name"]
-            default_price = pending["default_price"]
-            context.user_data.pop("pending_order", None)
-
-            order = OrderStore.add(f"{category}_{key}", service_name, default_price)
-            text = Reports.confirmation(order)
-            master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
-            run_safe_background_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
-        return
-
-    if data == "delete_confirm":
-        text = Reports.delete_confirmation_preview()
-        if "مفيش" in text:
-            master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
-            run_safe_background_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
+    # [2] استقبال اسم وسعر الخدمة الجديدة
+    elif data["state"] == "awaiting_new_service_name" and message.content_type == 'text':
+        text_received = message.text.strip()
+        try: bot.delete_message(chat_id, message.message_id)
+        except Exception: pass
+            
+        if "—" in text_received:
+            try:
+                srv_name, srv_price = text_received.split("—")
+                srv_name = srv_name.strip()
+                srv_price = int(srv_price.strip())
+                cat_id = data["selected_cat_id"]
+                
+                if cat_id:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("INSERT INTO services (category_id, name, price) VALUES (?, ?, ?)", (cat_id, srv_name, srv_price))
+                        conn.commit()
+                    text = f"✅ *تمت إضافة الإجراء الجديد بنجاح!*\n\n🛠️ الخدمة: {srv_name}\n💰 السعر: {srv_price}ج"
+                else:
+                    text = "❌ خطأ في تحديد القسم الحالي المسؤول."
+            except Exception as e:
+                text = f"❌ خطأ في معالجة المدخلات، تأكد من الصيغة الرقمية الصحيحة.\n`{str(e)}`"
         else:
-            await ensure_single_master_message(update, context, text, UI.confirm_delete())
+            text = "❌ صيغة غير صحيحة. يجب كتابتها هكذا: `غسيل شامل — 300`."
+            
+        update_user_state(chat_id, state="main_menu")
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⚙️ العودة للضبط", callback_data="settings_main"))
+        bot.send_message(chat_id, text, reply_markup=markup)
         return
 
-    if data.startswith("menu_"):
-        category = data.replace("menu_", "")
-        if category in SERVICES:
-            label = SERVICES[category]["label"]
-            text = label + "\n\nاضغط لتسجيل الطلب:"
-            await ensure_single_master_message(update, context, text, UI.service_menu(category))
-        return
+    # [3] معالجة استقبال ملف الـ CSV
+    elif data["state"] == "awaiting_restore_file":
+        if message.content_type == 'document' and message.document.file_name.endswith('.csv'):
+            try:
+                file_info = bot.get_file(message.document.file_id)
+                downloaded_file = bot.download_file(file_info.file_path)
+                csv_content = downloaded_file.decode('utf-8-sig', errors='ignore')
+                csv_file = io.StringIO(csv_content)
+                reader = csv.reader(csv_file)
+                header = next(reader, None)
+                
+                if not header or "نوع الخدمة" not in header or "السعر" not in header:
+                    raise ValueError("الملف المرفوع لا يطابق الهيكلية المطلوبة.")
+                
+                valid_rows = []
+                for row in reader:
+                    if len(row) >= 5:
+                        clean_date = normalize_date(row[4])
+                        # ربط السجلات القديمة تلقائياً بـ ID القسم (افتراضياً 1) لتفادي قيم الـ Null
+                        valid_rows.append((chat_id, int(row[0]), 1, row[1], int(row[2]), row[3], clean_date))
+                
+                if valid_rows:
+                    with sqlite3.connect(DB_FILE) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("DELETE FROM orders WHERE chat_id = ?", (chat_id,))
+                        cursor.executemany('''
+                            INSERT INTO orders (chat_id, order_id_user, category_id, service, price, time, date)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', valid_rows)
+                        conn.commit()
+                    text = f"✨ *تم استعادة البيانات لعدد {len(valid_rows)} طلب!*"
+                else:
+                    text = "❌ الملف المرفوع لا يحتوي على سجلات صالحة."
+            except Exception as e:
+                text = f"❌ *فشلت عملية الاستعادة:*\n`{str(e)}`"
+            
+            try: bot.delete_message(chat_id, message.message_id)
+            except Exception: pass
+                
+            update_user_state(chat_id, state="main_menu")
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu"))
+            bot.send_message(chat_id, text, reply_markup=markup)
+            return
 
-    if data.startswith("order_"):
-        parts = data.replace("order_", "").split("_", 1)
-        if len(parts) == 2:
-            category, key = parts
-            if category in SERVICES and key in SERVICES[category]["items"]:
-                await start_price_confirmation(update, context, category, key)
-        return
+    # [4] معالجة إدخال السعر المخصص يدوياً في الشات
+    elif data["state"] == "awaiting_price" and data["pending_order"] and message.content_type == 'text':
+        text_clean = message.text.strip()
+        if text_clean.isdigit():
+            custom_price = int(text_clean)
+            po = data["pending_order"]
+            cat_id = data["selected_cat_id"]
+            order = record_order(chat_id, cat_id, po["service"], custom_price)
+            
+            try: bot.delete_message(chat_id, message.message_id)
+            except Exception: pass
+                
+            text = f"✅ *تم التسجيل #{order['id']}*\n\n🛠️ {order['service']}\n💰 {order['price']}ج\n\n⏳ رجوع تلقائي..."
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
+            
+            try:
+                bot.edit_message_text(chat_id=chat_id, message_id=target_msg_id, text=text, reply_markup=markup)
+                scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, target_msg_id])
+            except Exception:
+                sent = bot.send_message(chat_id, text, reply_markup=markup)
+                scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, sent.message_id])
+            return
 
-    if data == "delete_last":
-        deleted = OrderStore.pop_last()
-        if deleted:
-            text = (
-                "🗑️ *تم الحذف*\n\n"
-                "#" + str(deleted['id']) + " " + deleted['service_name'] + "\n"
-                "💰 " + str(deleted['price']) + "ج\n\n"
-                "⏳ رجوع تلقائي للقائمة بعد 2 ثانية..."
-            )
-        else:
-            text = "🗑️ *مفيش طلبات للحذف*\n\n⏳ رجوع تلقائي..."
-        master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
-        run_safe_background_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
-        return
+    try: bot.delete_message(chat_id, message.message_id)
+    except Exception: pass
 
-    report_map = {
-        "report_today":   Reports.daily(),
-        "report_month":   Reports.monthly(),
-        "report_monthly": Reports.all_months(),
-    }
-
-    if data in report_map:
-        await ensure_single_master_message(update, context, report_map[data], UI.back_only())
-        return
-
-    if data == "backup_menu":
-        text = "💾 *إدارة الباك اب*\n\nاختار الإجراء:"
-        await ensure_single_master_message(update, context, text, UI.backup_menu())
-        return
-
-    if data == "backup_export":
-        filepath = BackupManager.export_csv()
-        if filepath:
-            BackupManager.cleanup_old_backups(keep=30)
-            await safe_send_document(context, chat_id, filepath, caption="📤 تصدير البيانات\n\nملف CSV بكل الطلبات.")
-            text = "✅ *تم التصدير*\n\nملف CSV تم إرساله."
-        else:
-            text = "📝 *مفيش بيانات للتصدير*"
-        await ensure_single_master_message(update, context, text, UI.backup_menu())
-        return
-
-    if data == "backup_restore_list":
-        backups = BackupManager.list_backups()
-        if backups:
-            text = "📥 *استرجاع باك اب*\n\nاختار الملف:"
-        else:
-            text = "📝 *مفيش باك اب متاح*"
-        await ensure_single_master_message(update, context, text, UI.backup_list())
-        return
-
-    if data.startswith("restore_"):
-        filename = data.replace("restore_", "")
-        text = (
-            "⚠️ *تأكيد الاسترجاع*\n\n"
-            "ملف: `" + filename + "`\n"
-            "هيتم استبدال كل البيانات الحالية!\n\n"
-            "متأكد؟"
-        )
-        await ensure_single_master_message(update, context, text, UI.confirm_restore(filename))
-        return
-
-    if data.startswith("confirm_restore_"):
-        filename = data.replace("confirm_restore_", "")
-        filepath = os.path.join(BACKUP_DIR, filename)
-        success, msg = BackupManager.restore_from_csv(filepath)
-        if success:
-            text = "✅ *تم الاسترجاع*\n\n" + msg
-        else:
-            text = "❌ *فشل الاسترجاع*\n\n" + msg
-        await ensure_single_master_message(update, context, text, UI.backup_menu())
-        return
-
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await handle_price_input(update, context):
-        return
-    try:
-        await context.bot.delete_message(
-            chat_id=update.message.chat_id,
-            message_id=update.message.message_id
-        )
-    except:
-        pass
-
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error {context.error}", exc_info=True)
-
-
-# ==================== MAIN ENTRY POINT ====================
-def main():
-    logger.info("Starting bot with built-in webhook server...")
-
-    # Python 3.12+ Safe Initialization: Let PTB manage the event loop context natively.
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    application.add_error_handler(error_handler)
-
-    webhook_url = RENDER_EXTERNAL_URL + WEBHOOK_PATH
-
-    logger.info(f"Webhook URL: {webhook_url}")
-    logger.info(f"Listening on port: {PORT}")
-
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=webhook_url,
-    )
-
-
-if __name__ == "__main__":
-    main()
+# --- Start Poll Engine ---
+if __name__ == '__main__':
+    print("Persistent Database Bot with Dynamic Settings Control is running...")
+    bot.infinity_polling()
