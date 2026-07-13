@@ -1,6 +1,6 @@
 """
 🚗 Car Service Tracker Bot — Render Production Version
-Compatible with Python 3.14
+Compatible with Python 3.12+ (Up to 3.14)
 """
 
 import logging
@@ -45,6 +45,16 @@ WEBHOOK_PATH = "/webhook"
 PORT = int(os.environ.get("PORT", 10000))
 
 os.makedirs(BACKUP_DIR, exist_ok=True)
+
+# Global background task registry to prevent Python garbage collection drops
+RUNNING_TASKS = set()
+
+def run_safe_background_task(coro):
+    """Safely schedules a background task keeping a strong reference."""
+    task = asyncio.create_task(coro)
+    RUNNING_TASKS.add(task)
+    task.add_done_callback(RUNNING_TASKS.discard)
+    return task
 
 # ==================== SERVICES DATA ====================
 SERVICES = {
@@ -530,7 +540,7 @@ async def start_price_confirmation(update: Update, context: ContextTypes.DEFAULT
     master_msg_id = await ensure_single_master_message(update, context, text, UI.confirm_price(service_name, default_price))
 
     chat_id = update.effective_chat.id
-    asyncio.create_task(_price_timeout(context, chat_id, master_msg_id))
+    run_safe_background_task(_price_timeout(context, chat_id, master_msg_id))
 
 
 async def _price_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, master_msg_id: int):
@@ -556,7 +566,7 @@ async def _price_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, maste
 
     try:
         await safe_edit_message(context, chat_id, master_msg_id, text, UI.back_only())
-        asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
+        run_safe_background_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
     except Exception as e:
         logger.warning(f"Auto-confirm failed: {e}")
 
@@ -605,7 +615,7 @@ async def handle_price_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if master_msg_id:
         await safe_edit_message(context, chat_id, master_msg_id, text, UI.back_only())
-        asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
+        run_safe_background_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
 
     return True
 
@@ -645,14 +655,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order = OrderStore.add(f"{category}_{key}", service_name, default_price)
             text = Reports.confirmation(order)
             master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
-            asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
+            run_safe_background_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
         return
 
     if data == "delete_confirm":
         text = Reports.delete_confirmation_preview()
         if "مفيش" in text:
             master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
-            asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
+            run_safe_background_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
         else:
             await ensure_single_master_message(update, context, text, UI.confirm_delete())
         return
@@ -685,7 +695,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text = "🗑️ *مفيش طلبات للحذف*\n\n⏳ رجوع تلقائي..."
         master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
-        asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
+        run_safe_background_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
         return
 
     report_map = {
@@ -725,7 +735,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("restore_"):
         filename = data.replace("restore_", "")
-        filepath = os.path.join(BACKUP_DIR, filename)
         text = (
             "⚠️ *تأكيد الاسترجاع*\n\n"
             "ملف: `" + filename + "`\n"
@@ -767,14 +776,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     logger.info("Starting bot with built-in webhook server...")
 
-    # CRITICAL FIX for Python 3.14:
-    # Explicitly create and set the event loop before PTB tries to get it
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
+    # Python 3.12+ Safe Initialization: Let PTB manage the event loop context natively.
     application = (
         Application.builder()
         .token(BOT_TOKEN)
