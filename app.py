@@ -1,13 +1,13 @@
 """
 🚗 Car Service Tracker Bot — Render Production Version
-Uses python-telegram-bot's built-in webhook server (officially supported).
-No Flask. No Gunicorn threading conflicts. No async loop issues.
+Compatible with Python 3.14
 """
 
 import logging
 import json
 import os
 import csv
+import asyncio
 from datetime import datetime
 from collections import defaultdict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -418,13 +418,11 @@ async def safe_edit_message(context, chat_id, message_id, text, markup, max_retr
         except TimedOut:
             logger.warning(f"TimedOut edit (attempt {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
-                import asyncio
                 await asyncio.sleep(2 ** attempt)
             else:
                 raise
         except RetryAfter as e:
             logger.warning(f"Rate limited, retrying after {e.retry_after}s")
-            import asyncio
             await asyncio.sleep(e.retry_after)
             return await safe_edit_message(context, chat_id, message_id, text, markup, max_retries=1)
         except BadRequest as e:
@@ -442,13 +440,11 @@ async def safe_edit_callback(query, text, markup, max_retries=3):
         except TimedOut:
             logger.warning(f"TimedOut callback (attempt {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
-                import asyncio
                 await asyncio.sleep(2 ** attempt)
             else:
                 raise
         except RetryAfter as e:
             logger.warning(f"Rate limited, retrying after {e.retry_after}s")
-            import asyncio
             await asyncio.sleep(e.retry_after)
             return await safe_edit_callback(query, text, markup, max_retries=1)
         except BadRequest as e:
@@ -470,11 +466,9 @@ async def safe_send_document(context, chat_id, filepath, caption="", max_retries
         except TimedOut:
             logger.warning(f"TimedOut sending doc (attempt {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
-                import asyncio
                 await asyncio.sleep(2 ** attempt)
         except RetryAfter as e:
             logger.warning(f"Rate limited, retrying after {e.retry_after}s")
-            import asyncio
             await asyncio.sleep(e.retry_after)
             return await safe_send_document(context, chat_id, filepath, caption, max_retries=1)
     return False
@@ -509,7 +503,6 @@ async def ensure_single_master_message(update: Update, context: ContextTypes.DEF
 
 
 async def auto_return_to_main(context: ContextTypes.DEFAULT_TYPE, chat_id: int, master_msg_id: int, delay: int = 2):
-    import asyncio
     await asyncio.sleep(delay)
     try:
         text = Reports.overview()
@@ -537,12 +530,10 @@ async def start_price_confirmation(update: Update, context: ContextTypes.DEFAULT
     master_msg_id = await ensure_single_master_message(update, context, text, UI.confirm_price(service_name, default_price))
 
     chat_id = update.effective_chat.id
-    import asyncio
     asyncio.create_task(_price_timeout(context, chat_id, master_msg_id))
 
 
 async def _price_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, master_msg_id: int):
-    import asyncio
     await asyncio.sleep(10)
 
     if not context.user_data.get("awaiting_price"):
@@ -565,7 +556,6 @@ async def _price_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, maste
 
     try:
         await safe_edit_message(context, chat_id, master_msg_id, text, UI.back_only())
-        import asyncio
         asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
     except Exception as e:
         logger.warning(f"Auto-confirm failed: {e}")
@@ -615,7 +605,6 @@ async def handle_price_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if master_msg_id:
         await safe_edit_message(context, chat_id, master_msg_id, text, UI.back_only())
-        import asyncio
         asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
 
     return True
@@ -656,7 +645,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order = OrderStore.add(f"{category}_{key}", service_name, default_price)
             text = Reports.confirmation(order)
             master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
-            import asyncio
             asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
         return
 
@@ -664,7 +652,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = Reports.delete_confirmation_preview()
         if "مفيش" in text:
             master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
-            import asyncio
             asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
         else:
             await ensure_single_master_message(update, context, text, UI.confirm_delete())
@@ -698,7 +685,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text = "🗑️ *مفيش طلبات للحذف*\n\n⏳ رجوع تلقائي..."
         master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
-        import asyncio
         asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
         return
 
@@ -778,12 +764,16 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==================== MAIN ENTRY POINT ====================
-# This is the ONLY correct way to run PTB webhooks on Render.
-# Application.run_webhook() starts its own aiohttp server internally.
-# No Flask. No Gunicorn. No threading/async conflicts.
-
 def main():
     logger.info("Starting bot with built-in webhook server...")
+
+    # CRITICAL FIX for Python 3.14:
+    # Explicitly create and set the event loop before PTB tries to get it
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
     application = (
         Application.builder()
