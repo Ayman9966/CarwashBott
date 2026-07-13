@@ -1,17 +1,15 @@
 """
-🚗 Car Service Tracker Bot — Render-Ready Webhook Version
-Uses Flask + python-telegram-bot webhooks for reliable Render deployment.
-Compatible with Python 3.14
+🚗 Car Service Tracker Bot — Render Production Version
+Uses python-telegram-bot's built-in webhook server (officially supported).
+No Flask. No Gunicorn threading conflicts. No async loop issues.
 """
 
 import logging
 import json
 import os
-import asyncio
 import csv
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import defaultdict
-from flask import Flask, request, Response
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -27,10 +25,6 @@ from telegram.error import TimedOut, RetryAfter, BadRequest
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
-    handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -44,6 +38,9 @@ if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required!")
 
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+if not RENDER_EXTERNAL_URL:
+    raise ValueError("RENDER_EXTERNAL_URL environment variable is required! Example: https://carwashbott.onrender.com")
+
 WEBHOOK_PATH = "/webhook"
 PORT = int(os.environ.get("PORT", 10000))
 
@@ -421,11 +418,13 @@ async def safe_edit_message(context, chat_id, message_id, text, markup, max_retr
         except TimedOut:
             logger.warning(f"TimedOut edit (attempt {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
+                import asyncio
                 await asyncio.sleep(2 ** attempt)
             else:
                 raise
         except RetryAfter as e:
             logger.warning(f"Rate limited, retrying after {e.retry_after}s")
+            import asyncio
             await asyncio.sleep(e.retry_after)
             return await safe_edit_message(context, chat_id, message_id, text, markup, max_retries=1)
         except BadRequest as e:
@@ -443,11 +442,13 @@ async def safe_edit_callback(query, text, markup, max_retries=3):
         except TimedOut:
             logger.warning(f"TimedOut callback (attempt {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
+                import asyncio
                 await asyncio.sleep(2 ** attempt)
             else:
                 raise
         except RetryAfter as e:
             logger.warning(f"Rate limited, retrying after {e.retry_after}s")
+            import asyncio
             await asyncio.sleep(e.retry_after)
             return await safe_edit_callback(query, text, markup, max_retries=1)
         except BadRequest as e:
@@ -469,9 +470,11 @@ async def safe_send_document(context, chat_id, filepath, caption="", max_retries
         except TimedOut:
             logger.warning(f"TimedOut sending doc (attempt {attempt + 1}/{max_retries})")
             if attempt < max_retries - 1:
+                import asyncio
                 await asyncio.sleep(2 ** attempt)
         except RetryAfter as e:
             logger.warning(f"Rate limited, retrying after {e.retry_after}s")
+            import asyncio
             await asyncio.sleep(e.retry_after)
             return await safe_send_document(context, chat_id, filepath, caption, max_retries=1)
     return False
@@ -506,6 +509,7 @@ async def ensure_single_master_message(update: Update, context: ContextTypes.DEF
 
 
 async def auto_return_to_main(context: ContextTypes.DEFAULT_TYPE, chat_id: int, master_msg_id: int, delay: int = 2):
+    import asyncio
     await asyncio.sleep(delay)
     try:
         text = Reports.overview()
@@ -533,10 +537,12 @@ async def start_price_confirmation(update: Update, context: ContextTypes.DEFAULT
     master_msg_id = await ensure_single_master_message(update, context, text, UI.confirm_price(service_name, default_price))
 
     chat_id = update.effective_chat.id
+    import asyncio
     asyncio.create_task(_price_timeout(context, chat_id, master_msg_id))
 
 
 async def _price_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, master_msg_id: int):
+    import asyncio
     await asyncio.sleep(10)
 
     if not context.user_data.get("awaiting_price"):
@@ -559,6 +565,7 @@ async def _price_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id: int, maste
 
     try:
         await safe_edit_message(context, chat_id, master_msg_id, text, UI.back_only())
+        import asyncio
         asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
     except Exception as e:
         logger.warning(f"Auto-confirm failed: {e}")
@@ -608,6 +615,7 @@ async def handle_price_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     if master_msg_id:
         await safe_edit_message(context, chat_id, master_msg_id, text, UI.back_only())
+        import asyncio
         asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
 
     return True
@@ -648,6 +656,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order = OrderStore.add(f"{category}_{key}", service_name, default_price)
             text = Reports.confirmation(order)
             master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
+            import asyncio
             asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
         return
 
@@ -655,6 +664,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = Reports.delete_confirmation_preview()
         if "مفيش" in text:
             master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
+            import asyncio
             asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
         else:
             await ensure_single_master_message(update, context, text, UI.confirm_delete())
@@ -688,6 +698,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             text = "🗑️ *مفيش طلبات للحذف*\n\n⏳ رجوع تلقائي..."
         master_msg_id = await ensure_single_master_message(update, context, text, UI.back_only())
+        import asyncio
         asyncio.create_task(auto_return_to_main(context, chat_id, master_msg_id, delay=2))
         return
 
@@ -766,76 +777,37 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Update {update} caused error {context.error}", exc_info=True)
 
 
-# ==================== FLASK + WEBHOOK SETUP ====================
-# NOTE: The Flask app variable MUST be named 'app' for Gunicorn to find it
-app = Flask(__name__)
+# ==================== MAIN ENTRY POINT ====================
+# This is the ONLY correct way to run PTB webhooks on Render.
+# Application.run_webhook() starts its own aiohttp server internally.
+# No Flask. No Gunicorn. No threading/async conflicts.
 
-# Global application instance
-ptb_application: Application = None
+def main():
+    logger.info("Starting bot with built-in webhook server...")
 
-
-@app.route('/')
-def home():
-    return "🤖 Bot is running!"
-
-
-@app.route('/health')
-def health():
-    return {"status": "ok"}, 200
-
-
-@app.route(WEBHOOK_PATH, methods=['POST'])
-async def webhook():
-    """Receive updates from Telegram."""
-    global ptb_application
-    if ptb_application is None:
-        return Response("Bot not initialized", status=503)
-
-    update = Update.de_json(data=request.get_json(force=True), bot=ptb_application.bot)
-    await ptb_application.process_update(update)
-    return Response("ok", status=200)
-
-
-async def setup_bot():
-    """Initialize the bot application and set webhook."""
-    global ptb_application
-
-    ptb_application = (
+    application = (
         Application.builder()
         .token(BOT_TOKEN)
         .build()
     )
 
     # Add handlers
-    ptb_application.add_handler(CommandHandler("start", start))
-    ptb_application.add_handler(CallbackQueryHandler(handle_callback))
-    ptb_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    ptb_application.add_error_handler(error_handler)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    application.add_error_handler(error_handler)
 
-    # Initialize the application
-    await ptb_application.initialize()
+    webhook_url = RENDER_EXTERNAL_URL + WEBHOOK_PATH
 
-    # Set webhook
-    if RENDER_EXTERNAL_URL:
-        webhook_url = RENDER_EXTERNAL_URL + WEBHOOK_PATH
-        await ptb_application.bot.set_webhook(
-            url=webhook_url,
-            allowed_updates=Update.ALL_TYPES,
-        )
-        logger.info(f"Webhook set to: {webhook_url}")
-    else:
-        logger.warning("RENDER_EXTERNAL_URL not set — webhook not configured!")
+    logger.info(f"Webhook URL: {webhook_url}")
+    logger.info(f"Listening on port: {PORT}")
 
-    await ptb_application.start()
-    logger.info("Bot started with webhook mode")
-
-
-def run_flask():
-    """Run Flask with Gunicorn-compatible setup."""
-    app.run(host="0.0.0.0", port=PORT)
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=webhook_url,
+    )
 
 
 if __name__ == "__main__":
-    # Initialize bot before starting Flask
-    asyncio.run(setup_bot())
-    run_flask()
+    main()
