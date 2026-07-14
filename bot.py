@@ -626,6 +626,11 @@ def handle_callbacks(call):
     msg_id = call.message.message_id
     data = get_user_state(chat_id)
     
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    
     if call.data == "main_menu":
         update_user_state(chat_id, state="main_menu", clear_pending=True)
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=get_main_menu_text(chat_id), reply_markup=get_main_menu_markup())
@@ -643,23 +648,32 @@ def handle_callbacks(call):
             cursor = conn.cursor()
             cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
             cat_info = cursor.fetchone()
-            cursor.execute("SELECT name, price FROM services WHERE category_id = ? AND is_active = 1", (cat_id,))
+            cursor.execute("SELECT id, name, price FROM services WHERE category_id = ? AND is_active = 1", (cat_id,))
             services = cursor.fetchall()
             
         title = f"{cat_info[1]} {cat_info[0]}"
         markup = types.InlineKeyboardMarkup(row_width=1)
         
         for srv in services:
-            markup.add(types.InlineKeyboardButton(f"{srv[0]} — {srv[1]}ج", callback_data=f"srv_{srv[0]}_{srv[1]}"))
+            markup.add(types.InlineKeyboardButton(f"{srv[1]} — {srv[2]}ج", callback_data=f"srv_{srv[0]}"))
             
         markup.add(types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"📍 قسم: *{title}*\n\nاضغط لتسجيل الإجراء مباشرة:", reply_markup=markup)
 
     elif call.data.startswith("srv_"):
-        parts = call.data.split("_")
-        service_name = parts[1]
-        default_price = int(parts[2])
+        srv_id = int(call.data.split("_")[1])
         cat_id = data["selected_cat_id"]
+        
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, price FROM services WHERE id = ?", (srv_id,))
+            srv_row = cursor.fetchone()
+        
+        if not srv_row:
+            bot.answer_callback_query(call.id, "❌ الخدمة دي مش موجودة، ممكن تكون اتحذفت.", show_alert=True)
+            return
+        
+        service_name, default_price = srv_row[0], srv_row[1]
         
         update_user_state(chat_id, state="awaiting_price", pending_order={"service": service_name, "price": default_price}, last_bot_msg_id=msg_id)
         
@@ -744,6 +758,7 @@ def handle_callbacks(call):
             text = "❌ لا توجد أقسام لحذفها."
             markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="backup_menu"))
             bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+            return
             
         for cat in cats:
             markup.add(types.InlineKeyboardButton(f"🗑️ {cat[2]} {cat[1]}", callback_data=f"delcat_{cat[0]}"))
@@ -802,6 +817,7 @@ def handle_callbacks(call):
             text = "❌ لا توجد خدمات في هذا القسم لحذفها."
             markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_main"))
             bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+            return
             
         for srv in services:
             markup.add(types.InlineKeyboardButton(f"🗑️ {srv[1]} — {srv[2]}ج", callback_data=f"delsrv_{srv[0]}"))
