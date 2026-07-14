@@ -108,6 +108,60 @@ def fetch_services_from_google_sheets():
         print(f"❌ Error fetching from Google Sheets: {e}")
         return SERVICES_CACHE
 
+def fetch_orders_from_google_sheets():
+    """Fetch ALL orders from Google Sheets for restore"""
+    try:
+        # Call Apps Script with ?action=getOrders to get all orders
+        url = f"{GOOGLE_APPS_SCRIPT_URL}?action=getOrders"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if isinstance(data, list):
+            print(f"✅ Restored {len(data)} orders from Google Sheets")
+            return data
+        return []
+    except Exception as e:
+        print(f"❌ Error fetching orders from Google Sheets: {e}")
+        return []
+
+def restore_orders_from_sheets():
+    """Restore all orders from Google Sheets into SQLite on startup"""
+    orders = fetch_orders_from_google_sheets()
+    if not orders:
+        print("ℹ️ No orders to restore from Google Sheets")
+        return
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Clear existing orders to avoid duplicates
+    cursor.execute("DELETE FROM orders")
+    
+    restored_count = 0
+    for order in orders:
+        try:
+            chat_id = int(order.get("chatId", 0))
+            order_id_user = int(order.get("num", 0))
+            department = order.get("department", "")
+            service = order.get("service", "")
+            price = int(order.get("price", 0))
+            date_str = order.get("date", "")
+            time_str = order.get("time", "")
+            
+            cursor.execute('''
+                INSERT INTO orders (chat_id, order_id_user, department, service, price, time, date)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (chat_id, order_id_user, department, service, price, time_str, date_str))
+            restored_count += 1
+        except Exception as e:
+            print(f"⚠️ Skipped invalid order row: {e}")
+            continue
+    
+    conn.commit()
+    conn.close()
+    print(f"✅ Restored {restored_count} orders into SQLite")
+
 def _async_log_to_sheets(department, service, price, chat_id):
     """Background thread logging — NEVER blocks user"""
     try:
@@ -311,8 +365,6 @@ def clean_chat(chat_id, master_msg_id):
         return
     
     try:
-        # Get recent messages and delete anything that's not the master
-        # We try to delete a range of possible message IDs around master
         for offset in range(1, 15):
             try:
                 bot.delete_message(chat_id, master_msg_id + offset)
@@ -336,14 +388,10 @@ def ensure_master_message(chat_id, text, markup=None):
             bot.edit_message_text(chat_id=chat_id, message_id=master_msg_id, text=text, reply_markup=markup)
             return master_msg_id
         except Exception as e:
-            # If edit fails, message might be deleted — send new one
             pass
     
-    # Send new master message
     msg = bot.send_message(chat_id, text, reply_markup=markup)
     update_user_state(chat_id, master_msg_id=msg.message_id)
-    
-    # Clean any stray messages
     clean_chat(chat_id, msg.message_id)
     
     return msg.message_id
@@ -360,20 +408,17 @@ def handle_callback(call):
     except:
         pass
     
-    # Track master message
     master_msg_id = data.get("master_msg_id")
     if not master_msg_id or master_msg_id != msg_id:
         update_user_state(chat_id, master_msg_id=msg_id)
         master_msg_id = msg_id
     
-    # Main menu
     if call.data == "main_menu":
         text = get_main_menu_text(chat_id)
         markup = get_departments_markup()
         update_user_state(chat_id, state="main_menu", clear_pending=True)
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
     
-    # Department selection
     elif call.data.startswith("dept_"):
         department = call.data.replace("dept_", "")
         text = f"📦 *{department}*\n\n🔍 اختر الخدمة:"
@@ -381,14 +426,12 @@ def handle_callback(call):
         update_user_state(chat_id, state="selecting_service", pending_department=department)
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
     
-    # Service selection — FAST PATH
     elif call.data.startswith("service_"):
         parts = call.data.split("_", 3)
         department = parts[1]
         service = parts[2]
         price = int(parts[3])
         
-        # Record order (SQLite only, Sheets async)
         order = record_order(chat_id, department, service, price)
         
         text = f"✅ *تم التسجيل #{order['id']}*\n\n"
@@ -403,7 +446,6 @@ def handle_callback(call):
         update_user_state(chat_id, state="main_menu", clear_pending=True)
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
         
-        # Auto return to main menu after 1.5 seconds
         scheduler.add_job(
             auto_return_to_main,
             'date',
@@ -411,14 +453,12 @@ def handle_callback(call):
             args=[chat_id, msg_id]
         )
     
-    # Reports menu
     elif call.data == "menu_reports":
         text = "📊 *التقارير والإحصائيات*\n\nاختر نطاق التقرير:"
         markup = get_reports_menu_markup()
         update_user_state(chat_id, state="reports_menu")
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
     
-    # Report - Today
     elif call.data == "rep_today":
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         orders = get_user_orders(chat_id)
@@ -441,7 +481,6 @@ def handle_callback(call):
         markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="menu_reports"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
     
-    # Report - Month
     elif call.data == "rep_month":
         today = datetime.date.today()
         month_start = datetime.date(today.year, today.month, 1)
@@ -461,7 +500,6 @@ def handle_callback(call):
         markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="menu_reports"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
     
-    # Export CSV — sends document then returns to master
     elif call.data == "export_csv":
         orders = get_user_orders(chat_id)
         today_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -477,16 +515,13 @@ def handle_callback(call):
         bio = io.BytesIO(csv_buffer.getvalue().encode('utf-8'))
         bio.name = f"تقرير_{chat_id}_{today_str}.csv"
         
-        # Edit master to loading state
         text = "📤 جاري تصدير البيانات..."
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="menu_reports"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
         
         try:
-            # Send document as new message
             doc_msg = bot.send_document(chat_id, bio, caption="📤 تم تصدير البيانات بنجاح!")
-            # Delete it after 3 seconds to keep chat clean
             scheduler.add_job(
                 lambda: bot.delete_message(chat_id, doc_msg.message_id),
                 'date',
@@ -495,7 +530,6 @@ def handle_callback(call):
         except Exception as e:
             print(f"Error sending CSV: {e}")
         
-        # Return to reports menu on master message
         scheduler.add_job(
             lambda: bot.edit_message_text(
                 chat_id=chat_id, 
@@ -522,13 +556,11 @@ def auto_return_to_main(chat_id, msg_id):
 def start_handler(message):
     chat_id = message.chat.id
     
-    # Delete user's /start command immediately
     try:
         bot.delete_message(chat_id, message.message_id)
     except:
         pass
     
-    # Check if master message exists
     data = get_user_state(chat_id)
     master_msg_id = data.get("master_msg_id")
     
@@ -543,7 +575,6 @@ def start_handler(message):
         except:
             pass
     
-    # Send new master message
     msg = bot.send_message(chat_id, text, reply_markup=markup)
     update_user_state(chat_id, state="main_menu", master_msg_id=msg.message_id)
     clean_chat(chat_id, msg.message_id)
@@ -556,7 +587,6 @@ def handle_all_messages(message):
     except:
         pass
     
-    # Also clean any other stray messages around master
     data = get_user_state(message.chat.id)
     master_msg_id = data.get("master_msg_id")
     if master_msg_id:
@@ -586,5 +616,8 @@ if __name__ == '__main__':
     # Pre-fetch services on startup
     fetch_services_from_google_sheets()
     
-    print("✅ Bot is running — Single Message Mode + Async Sheets")
+    # RESTORE orders from Google Sheets on startup
+    restore_orders_from_sheets()
+    
+    print("✅ Bot is running — Single Message Mode + Async Sheets + Auto-Restore")
     bot.infinity_polling()
