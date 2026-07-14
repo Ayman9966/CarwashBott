@@ -3,6 +3,8 @@ import io
 import csv
 import sqlite3
 import os
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -275,38 +277,336 @@ def normalize_date(date_str):
 
 def auto_daily_backup():
     today_str = datetime.date.today().strftime("%Y-%m-%d")
-    csv_buffer = io.StringIO()
-    csv_buffer.write('\ufeff')
-    writer = csv.writer(csv_buffer)
-    writer.writerow(["رقم الطلب", "نوع الخدمة", "السعر", "الوقت", "التاريخ"])
+    current_month = datetime.date.today().strftime("%Y-%m")
+    current_year = datetime.date.today().strftime("%Y")
     
+    wb = Workbook()
+    
+    # --- Styles ---
+    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+    header_font = Font(color="FFFFFF", bold=True, size=12)
+    subheader_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+    subheader_font = Font(color="FFFFFF", bold=True, size=11)
+    title_font = Font(size=16, bold=True, color="1F4E78")
+    money_font = Font(size=11, color="006100")
+    money_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+    warning_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+    warning_font = Font(color="9C0006")
+    thin_border = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin")
+    )
+    center_align = Alignment(horizontal="center", vertical="center")
+    right_align = Alignment(horizontal="right", vertical="center")
+    
+    # Fetch all data
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT order_id_user, service, price, time, date FROM orders")
+        cursor.execute("SELECT order_id_user, service, price, time, date, chat_id, category_id FROM orders ORDER BY date DESC, time DESC")
         all_orders = cursor.fetchall()
+        cursor.execute("SELECT id, name, icon FROM categories")
+        categories = {row[0]: f"{row[2]} {row[1]}" for row in cursor.fetchall()}
+        cursor.execute("SELECT id, name, category_id FROM services")
+        services_map = {row[0]: row[1] for row in cursor.fetchall()}
     
-    total_day_rev = 0
-    total_day_orders = 0
+    today_orders = [o for o in all_orders if o[4] == today_str]
+    month_orders = [o for o in all_orders if o[4].startswith(current_month)]
+    year_orders = [o for o in all_orders if o[4].startswith(current_year)]
+    total_day_rev = sum(o[2] for o in today_orders)
+    total_month_rev = sum(o[2] for o in month_orders)
+    total_year_rev = sum(o[2] for o in year_orders)
+    total_all_rev = sum(o[2] for o in all_orders)
     
-    for row in all_orders:
-        writer.writerow(row)
-        if row[4] == today_str:
-            total_day_rev += row[2]
-            total_day_orders += 1
+    # ============================================
+    # SHEET 1: DASHBOARD
+    # ============================================
+    ws_dash = wb.active
+    ws_dash.title = "Dashboard"
     
-    csv_buffer.seek(0)
-    bio = io.BytesIO(csv_buffer.getvalue().encode('utf-8'))
-    bio.name = f"قاعدة_البيانات_الكاملة_تاريخ_{today_str}.csv"
+    ws_dash.merge_cells("A1:F1")
+    ws_dash["A1"] = f"Wash & Scan - Daily Report ({today_str})"
+    ws_dash["A1"].font = title_font
+    ws_dash["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws_dash.row_dimensions[1].height = 30
+    
+    kpi_data = [
+        ["Today Revenue", f"{total_day_rev} EGP", len(today_orders), "orders"],
+        ["Month Revenue", f"{total_month_rev} EGP", len(month_orders), "orders"],
+        ["Year Revenue", f"{total_year_rev} EGP", len(year_orders), "orders"],
+        ["All Time Revenue", f"{total_all_rev} EGP", len(all_orders), "orders"]
+    ]
+    
+    ws_dash["A3"] = "Period"
+    ws_dash["B3"] = "Revenue"
+    ws_dash["C3"] = "Count"
+    ws_dash["D3"] = "Unit"
+    for col in ["A", "B", "C", "D"]:
+        ws_dash[f"{col}3"].fill = header_fill
+        ws_dash[f"{col}3"].font = header_font
+        ws_dash[f"{col}3"].alignment = center_align
+        ws_dash[f"{col}3"].border = thin_border
+    
+    for idx, row in enumerate(kpi_data, start=4):
+        ws_dash[f"A{idx}"] = row[0]
+        ws_dash[f"B{idx}"] = row[1]
+        ws_dash[f"C{idx}"] = row[2]
+        ws_dash[f"D{idx}"] = row[3]
+        for col in ["A", "B", "C", "D"]:
+            ws_dash[f"{col}{idx}"].border = thin_border
+            ws_dash[f"{col}{idx}"].alignment = center_align
+        ws_dash[f"B{idx}"].fill = money_fill
+        ws_dash[f"B{idx}"].font = money_font
+    
+    ws_dash["A9"] = "Category Breakdown - Today"
+    ws_dash["A9"].font = subheader_font
+    ws_dash["A9"].fill = subheader_fill
+    ws_dash.merge_cells("A9:D9")
+    
+    ws_dash["A10"] = "Category"
+    ws_dash["B10"] = "Orders"
+    ws_dash["C10"] = "Revenue"
+    ws_dash["D10"] = "% Share"
+    for col in ["A", "B", "C", "D"]:
+        ws_dash[f"{col}10"].fill = header_fill
+        ws_dash[f"{col}10"].font = header_font
+        ws_dash[f"{col}10"].alignment = center_align
+        ws_dash[f"{col}10"].border = thin_border
+    
+    cat_breakdown = {}
+    for o in today_orders:
+        cat_name = categories.get(o[6], "Unknown")
+        if cat_name not in cat_breakdown:
+            cat_breakdown[cat_name] = {"count": 0, "revenue": 0}
+        cat_breakdown[cat_name]["count"] += 1
+        cat_breakdown[cat_name]["revenue"] += o[2]
+    
+    row_idx = 11
+    for cat_name, stats in sorted(cat_breakdown.items(), key=lambda x: x[1]["revenue"], reverse=True):
+        pct = (stats["revenue"] / total_day_rev * 100) if total_day_rev > 0 else 0
+        ws_dash[f"A{row_idx}"] = cat_name
+        ws_dash[f"B{row_idx}"] = stats["count"]
+        ws_dash[f"C{row_idx}"] = stats["revenue"]
+        ws_dash[f"D{row_idx}"] = f"{pct:.1f}%"
+        for col in ["A", "B", "C", "D"]:
+            ws_dash[f"{col}{row_idx}"].border = thin_border
+            ws_dash[f"{col}{row_idx}"].alignment = center_align
+        ws_dash[f"C{row_idx}"].fill = money_fill
+        row_idx += 1
+    
+    ws_dash.column_dimensions["A"].width = 22
+    ws_dash.column_dimensions["B"].width = 18
+    ws_dash.column_dimensions["C"].width = 12
+    ws_dash.column_dimensions["D"].width = 12
+    
+    # ============================================
+    # SHEET 2: ALL ORDERS
+    # ============================================
+    ws_orders = wb.create_sheet("All Orders")
+    
+    headers = ["#", "Service", "Category", "Price (EGP)", "Time", "Date", "Order ID"]
+    for col_idx, header in enumerate(headers, 1):
+        cell = ws_orders.cell(row=1, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center_align
+        cell.border = thin_border
+    
+    for row_idx, order in enumerate(all_orders, start=2):
+        ws_orders.cell(row=row_idx, column=1, value=row_idx-1)
+        ws_orders.cell(row=row_idx, column=2, value=order[1])
+        ws_orders.cell(row=row_idx, column=3, value=categories.get(order[6], "Unknown"))
+        ws_orders.cell(row=row_idx, column=4, value=order[2])
+        ws_orders.cell(row=row_idx, column=5, value=order[3])
+        ws_orders.cell(row=row_idx, column=6, value=order[4])
+        ws_orders.cell(row=row_idx, column=7, value=order[0])
+        for col in range(1, 8):
+            ws_orders.cell(row=row_idx, column=col).border = thin_border
+            ws_orders.cell(row=row_idx, column=col).alignment = center_align
+        ws_orders.cell(row=row_idx, column=4).fill = money_fill
+        ws_orders.cell(row=row_idx, column=4).font = money_font
+    
+    total_row = len(all_orders) + 2
+    ws_orders.cell(row=total_row, column=1, value="TOTAL")
+    ws_orders.cell(row=total_row, column=4, value=total_all_rev)
+    for col in [1, 4]:
+        ws_orders.cell(row=total_row, column=col).font = Font(bold=True, size=12)
+        ws_orders.cell(row=total_row, column=col).fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
+        ws_orders.cell(row=total_row, column=col).border = thin_border
+    
+    ws_orders.column_dimensions["A"].width = 6
+    ws_orders.column_dimensions["B"].width = 28
+    ws_orders.column_dimensions["C"].width = 22
+    ws_orders.column_dimensions["D"].width = 14
+    ws_orders.column_dimensions["E"].width = 10
+    ws_orders.column_dimensions["F"].width = 12
+    ws_orders.column_dimensions["G"].width = 10
+    
+    # ============================================
+    # SHEET 3: TODAY ORDERS
+    # ============================================
+    ws_today = wb.create_sheet("Today Orders")
+    
+    ws_today.merge_cells("A1:F1")
+    ws_today["A1"] = f"Orders for {today_str}"
+    ws_today["A1"].font = title_font
+    ws_today["A1"].alignment = center_align
+    ws_today.row_dimensions[1].height = 25
+    
+    headers_today = ["#", "Service", "Category", "Price", "Time", "Order ID"]
+    for col_idx, header in enumerate(headers_today, 1):
+        cell = ws_today.cell(row=3, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center_align
+        cell.border = thin_border
+    
+    for row_idx, order in enumerate(today_orders, start=4):
+        ws_today.cell(row=row_idx, column=1, value=row_idx-3)
+        ws_today.cell(row=row_idx, column=2, value=order[1])
+        ws_today.cell(row=row_idx, column=3, value=categories.get(order[6], "Unknown"))
+        ws_today.cell(row=row_idx, column=4, value=order[2])
+        ws_today.cell(row=row_idx, column=5, value=order[3])
+        ws_today.cell(row=row_idx, column=6, value=order[0])
+        for col in range(1, 7):
+            ws_today.cell(row=row_idx, column=col).border = thin_border
+            ws_today.cell(row=row_idx, column=col).alignment = center_align
+        ws_today.cell(row=row_idx, column=4).fill = money_fill
+    
+    t_total = len(today_orders) + 4
+    ws_today.cell(row=t_total, column=1, value="TOTAL")
+    ws_today.cell(row=t_total, column=4, value=total_day_rev)
+    for col in [1, 4]:
+        ws_today.cell(row=t_total, column=col).font = Font(bold=True, size=12)
+        ws_today.cell(row=t_total, column=col).fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
+        ws_today.cell(row=t_total, column=col).border = thin_border
+    
+    ws_today.column_dimensions["A"].width = 6
+    ws_today.column_dimensions["B"].width = 28
+    ws_today.column_dimensions["C"].width = 22
+    ws_today.column_dimensions["D"].width = 14
+    ws_today.column_dimensions["E"].width = 10
+    ws_today.column_dimensions["F"].width = 10
+    
+    # ============================================
+    # SHEET 4: MONTHLY SUMMARY
+    # ============================================
+    ws_month = wb.create_sheet("Monthly Summary")
+    
+    ws_month.merge_cells("A1:E1")
+    ws_month["A1"] = f"Monthly Summary - {current_year}"
+    ws_month["A1"].font = title_font
+    ws_month["A1"].alignment = center_align
+    
+    month_headers = ["Month", "Total Orders", "Revenue (EGP)", "Avg Order", "Trend"]
+    for col_idx, header in enumerate(month_headers, 1):
+        cell = ws_month.cell(row=3, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center_align
+        cell.border = thin_border
+    
+    monthly_data = {}
+    for o in all_orders:
+        m = o[4][:7]
+        if m not in monthly_data:
+            monthly_data[m] = {"count": 0, "revenue": 0}
+        monthly_data[m]["count"] += 1
+        monthly_data[m]["revenue"] += o[2]
+    
+    row_idx = 4
+    prev_rev = 0
+    for month in sorted(monthly_data.keys(), reverse=True):
+        stats = monthly_data[month]
+        avg = stats["revenue"] // stats["count"] if stats["count"] > 0 else 0
+        trend = "UP" if stats["revenue"] > prev_rev else "DOWN" if stats["revenue"] < prev_rev else "FLAT"
+        prev_rev = stats["revenue"]
+        ws_month.cell(row=row_idx, column=1, value=month)
+        ws_month.cell(row=row_idx, column=2, value=stats["count"])
+        ws_month.cell(row=row_idx, column=3, value=stats["revenue"])
+        ws_month.cell(row=row_idx, column=4, value=avg)
+        ws_month.cell(row=row_idx, column=5, value=trend)
+        for col in range(1, 6):
+            ws_month.cell(row=row_idx, column=col).border = thin_border
+            ws_month.cell(row=row_idx, column=col).alignment = center_align
+        ws_month.cell(row=row_idx, column=3).fill = money_fill
+        if trend == "UP":
+            ws_month.cell(row=row_idx, column=5).fill = money_fill
+        elif trend == "DOWN":
+            ws_month.cell(row=row_idx, column=5).fill = warning_fill
+            ws_month.cell(row=row_idx, column=5).font = warning_font
+        row_idx += 1
+    
+    ws_month.column_dimensions["A"].width = 12
+    ws_month.column_dimensions["B"].width = 14
+    ws_month.column_dimensions["C"].width = 16
+    ws_month.column_dimensions["D"].width = 12
+    ws_month.column_dimensions["E"].width = 10
+    
+    # ============================================
+    # SHEET 5: TOP SERVICES
+    # ============================================
+    ws_top = wb.create_sheet("Top Services")
+    
+    ws_top.merge_cells("A1:D1")
+    ws_top["A1"] = "Top Performing Services - All Time"
+    ws_top["A1"].font = title_font
+    ws_top["A1"].alignment = center_align
+    
+    top_headers = ["Rank", "Service", "Total Orders", "Total Revenue"]
+    for col_idx, header in enumerate(top_headers, 1):
+        cell = ws_top.cell(row=3, column=col_idx, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = center_align
+        cell.border = thin_border
+    
+    service_stats = {}
+    for o in all_orders:
+        svc = o[1]
+        if svc not in service_stats:
+            service_stats[svc] = {"count": 0, "revenue": 0}
+        service_stats[svc]["count"] += 1
+        service_stats[svc]["revenue"] += o[2]
+    
+    sorted_services = sorted(service_stats.items(), key=lambda x: x[1]["revenue"], reverse=True)
+    for rank, (svc, stats) in enumerate(sorted_services[:20], start=1):
+        row = rank + 3
+        ws_top.cell(row=row, column=1, value=rank)
+        ws_top.cell(row=row, column=2, value=svc)
+        ws_top.cell(row=row, column=3, value=stats["count"])
+        ws_top.cell(row=row, column=4, value=stats["revenue"])
+        for col in range(1, 5):
+            ws_top.cell(row=row, column=col).border = thin_border
+            ws_top.cell(row=row, column=col).alignment = center_align
+        ws_top.cell(row=row, column=4).fill = money_fill
+        if rank <= 3:
+            ws_top.cell(row=row, column=1).fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
+    
+    ws_top.column_dimensions["A"].width = 8
+    ws_top.column_dimensions["B"].width = 30
+    ws_top.column_dimensions["C"].width = 14
+    ws_top.column_dimensions["D"].width = 16
+    
+    # ============================================
+    # SAVE & SEND
+    # ============================================
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    bio.name = f"Daily_Report_{today_str}.xlsx"
     
     try:
-        report_text = f"🤖 *تقرير النسخ الاحتياطي التلقائي من SQLite*\n"
-        report_text += f"📅 تاريخ اليوم: `{today_str}`\n"
+        report_text = f"📊 *Daily Professional Report*\n"
+        report_text += f"📅 Date: `{today_str}`\n"
         report_text += "━━━━━━━━━━━━━━━━━━\n"
-        report_text += f"💰 إجمالي إيراد اليوم: *{total_day_rev} ج*\n"
-        report_text += f"📦 إجمالي عدد طلبات اليوم: *{total_day_orders}*\n\n"
-        report_text += "📂 مرفق ملف الباك أب الشامل لقاعدة البيانات لضمان عدم ضياع أي سجلات."
+        report_text += f"💰 Today: *{total_day_rev} EGP* ({len(today_orders)} orders)\n"
+        report_text += f"📈 Month: *{total_month_rev} EGP* ({len(month_orders)} orders)\n"
+        report_text += f"📊 Year: *{total_year_rev} EGP* ({len(year_orders)} orders)\n"
+        report_text += f"🏆 All Time: *{total_all_rev} EGP* ({len(all_orders)} orders)\n\n"
+        report_text += "📎 Attached: 5-sheet Excel workbook with full analytics"
         
         bot.send_document(ADMIN_CHAT_ID, bio, caption=report_text)
+        print(f"Daily backup sent: {bio.name}")
     except Exception as e:
         print(f"Failed to send automated backup: {e}")
 
