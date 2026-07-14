@@ -10,7 +10,9 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from telebot import TeleBot, types
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# --- Configuration & Initialization ---
+# ==========================================
+# 1. Configuration & Initialization
+# ==========================================
 API_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '0'))
 
@@ -19,114 +21,132 @@ if not API_TOKEN:
 
 bot = TeleBot(API_TOKEN, parse_mode='Markdown')
 
+# تشغيل الـ Scheduler مع تمكين تعديل الوظائف ديناميكياً
 scheduler = BackgroundScheduler()
 scheduler.start()
 
 DB_FILE = 'wash_and_scan.db'
 
-# --- Health Check Server (for Render Web Service) ---
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'OK')
-    def log_message(self, format, *args):
-        pass
 
-def run_health_server():
-    port = int(os.environ.get('PORT', 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthHandler)
-    server.serve_forever()
+# ==========================================
+# 2. Database Manager & Migrations
+# ==========================================
+class DatabaseManager:
+    """مستودع مركزي لإدارة اتصالات وعمليات قاعدة البيانات بأمان"""
+    @staticmethod
+    def get_connection():
+        conn = sqlite3.connect(DB_FILE)
+        # تفعيل WAL Mode لمنع تجمد وقفل قاعدة البيانات أثناء العمليات المتزامنة
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.row_factory = sqlite3.Row
+        return conn
 
-# Start health check in background thread
-threading.Thread(target=run_health_server, daemon=True).start()
-
-# --- Database Initialization & Migration ---
-def init_db():
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_states (
-                chat_id INTEGER PRIMARY KEY,
-                state TEXT DEFAULT 'main_menu',
-                pending_service TEXT,
-                pending_price INTEGER,
-                last_bot_msg_id INTEGER
-            )
-        ''')
-        
-        cursor.execute("PRAGMA table_info(user_states)")
-        columns = [column[1] for column in cursor.fetchall()]
-        if 'selected_cat_id' not in columns:
-            cursor.execute("ALTER TABLE user_states ADD COLUMN selected_cat_id INTEGER")
-            print("Added selected_cat_id to user_states")
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS categories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE,
-                icon TEXT
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS services (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category_id INTEGER,
-                name TEXT,
-                price INTEGER,
-                is_active INTEGER DEFAULT 1,
-                FOREIGN KEY(category_id) REFERENCES categories(id)
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER,
-                order_id_user INTEGER,
-                category_id INTEGER,
-                service TEXT,
-                price INTEGER,
-                time TEXT,
-                date TEXT
-            )
-        ''')
-        
-        cursor.execute("PRAGMA table_info(orders)")
-        order_columns = [column[1] for column in cursor.fetchall()]
-        if 'category_id' not in order_columns:
-            cursor.execute("ALTER TABLE orders ADD COLUMN category_id INTEGER")
-            print("Added category_id to orders")
+    @classmethod
+    def init_db(cls):
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
             
-        conn.commit()
+            # جدول حالات المستخدمين والـ States والـ Jobs المجدولة لمنع التداخل
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_states (
+                    chat_id INTEGER PRIMARY KEY,
+                    state TEXT DEFAULT 'main_menu',
+                    pending_service TEXT,
+                    pending_price INTEGER,
+                    last_bot_msg_id INTEGER,
+                    selected_cat_id INTEGER,
+                    active_job_id TEXT
+                )
+            ''')
+            
+            cursor.execute("PRAGMA table_info(user_states)")
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'selected_cat_id' not in columns:
+                cursor.execute("ALTER TABLE user_states ADD COLUMN selected_cat_id INTEGER")
+            if 'active_job_id' not in columns:
+                cursor.execute("ALTER TABLE user_states ADD COLUMN active_job_id TEXT")
+            
+            # جدول الأقسام
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS categories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE,
+                    icon TEXT
+                )
+            ''')
+            
+            # جدول الخدمات
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS services (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category_id INTEGER,
+                    name TEXT,
+                    price INTEGER,
+                    is_active INTEGER DEFAULT 1,
+                    FOREIGN KEY(category_id) REFERENCES categories(id)
+                )
+            ''')
+            
+            # جدول الطلبات والمبيعات
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER,
+                    order_id_user INTEGER,
+                    category_id INTEGER,
+                    service TEXT,
+                    price INTEGER,
+                    time TEXT,
+                    date TEXT
+                )
+            ''')
+            
+            cursor.execute("PRAGMA table_info(orders)")
+            order_columns = [column[1] for column in cursor.fetchall()]
+            if 'category_id' not in order_columns:
+                cursor.execute("ALTER TABLE orders ADD COLUMN category_id INTEGER")
+                
+            conn.commit()
 
-init_db()
+# تهيئة قاعدة البيانات فوراً عند بدء التشغيل
+DatabaseManager.init_db()
 
-# --- Helper Functions ---
+
+# ==========================================
+# 3. State Management & Helper Functions
+# ==========================================
 
 def get_user_state(chat_id):
-    with sqlite3.connect(DB_FILE) as conn:
+    with DatabaseManager.get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT state, pending_service, pending_price, last_bot_msg_id, selected_cat_id FROM user_states WHERE chat_id = ?", (chat_id,))
+        cursor.execute("""
+            SELECT state, pending_service, pending_price, last_bot_msg_id, selected_cat_id, active_job_id 
+            FROM user_states WHERE chat_id = ?
+        """, (chat_id,))
         row = cursor.fetchone()
         
         if not row:
             cursor.execute("INSERT INTO user_states (chat_id) VALUES (?)", (chat_id,))
             conn.commit()
-            return {"state": "main_menu", "pending_order": None, "last_bot_msg_id": None, "selected_cat_id": None}
+            return {
+                "state": "main_menu", 
+                "pending_order": None, 
+                "last_bot_msg_id": None, 
+                "selected_cat_id": None,
+                "active_job_id": None
+            }
         
-        pending_order = {"service": row[1], "price": row[2]} if row[1] else None
+        pending_order = {"service": row['pending_service'], "price": row['pending_price']} if row['pending_service'] else None
         return {
-            "state": row[0],
+            "state": row['state'],
             "pending_order": pending_order,
-            "last_bot_msg_id": row[3],
-            "selected_cat_id": row[4]
+            "last_bot_msg_id": row['last_bot_msg_id'],
+            "selected_cat_id": row['selected_cat_id'],
+            "active_job_id": row['active_job_id']
         }
 
-def update_user_state(chat_id, state=None, pending_order=None, last_bot_msg_id=None, selected_cat_id=None, clear_pending=False):
-    with sqlite3.connect(DB_FILE) as conn:
+def update_user_state(chat_id, state=None, pending_order=None, last_bot_msg_id=None, selected_cat_id=None, active_job_id=None, clear_pending=False):
+    with DatabaseManager.get_connection() as conn:
         cursor = conn.cursor()
         if state:
             cursor.execute("UPDATE user_states SET state = ? WHERE chat_id = ?", (state, chat_id))
@@ -134,32 +154,52 @@ def update_user_state(chat_id, state=None, pending_order=None, last_bot_msg_id=N
             cursor.execute("UPDATE user_states SET last_bot_msg_id = ? WHERE chat_id = ?", (last_bot_msg_id, chat_id))
         if selected_cat_id is not None:
             cursor.execute("UPDATE user_states SET selected_cat_id = ? WHERE chat_id = ?", (selected_cat_id, chat_id))
+        if active_job_id is not None:
+            cursor.execute("UPDATE user_states SET active_job_id = ? WHERE chat_id = ?", (active_job_id, chat_id))
         if pending_order:
             cursor.execute("UPDATE user_states SET pending_service = ?, pending_price = ? WHERE chat_id = ?", 
                            (pending_order["service"], pending_order["price"], chat_id))
         if clear_pending:
-            cursor.execute("UPDATE user_states SET pending_service = NULL, pending_price = NULL, selected_cat_id = NULL WHERE chat_id = ?", (chat_id,))
+            # تنظيف الـ States القديمة وأي مهمة مجدولة معلقة
+            cursor.execute("""
+                UPDATE user_states 
+                SET pending_service = NULL, pending_price = NULL, selected_cat_id = NULL, active_job_id = NULL 
+                WHERE chat_id = ?
+            """, (chat_id,))
         conn.commit()
 
+def cancel_active_job(chat_id):
+    """إلغاء أي مهمة مؤقت سعر مجدولة للمستخدم لمنع تسجيل عمليات مكررة"""
+    state_data = get_user_state(chat_id)
+    job_id = state_data.get("active_job_id")
+    if job_id:
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass # تم تنفيذ الوظيفة بالفعل أو تم إلغاؤها مسبقاً
+        update_user_state(chat_id, active_job_id="NULL_CLEAR") # تصفير حقل المهمة النشطة
+
 def get_user_orders(chat_id):
-    with sqlite3.connect(DB_FILE) as conn:
-        conn.row_factory = sqlite3.Row
+    with DatabaseManager.get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT order_id_user AS id, category_id, service, price, time, date FROM orders WHERE chat_id = ? ORDER BY id ASC", (chat_id,))
+        cursor.execute("""
+            SELECT order_id_user AS id, category_id, service, price, time, date 
+            FROM orders WHERE chat_id = ? ORDER BY id ASC
+        """, (chat_id,))
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
 
 def get_main_menu_markup():
     markup = types.InlineKeyboardMarkup(row_width=2)
     
-    with sqlite3.connect(DB_FILE) as conn:
+    with DatabaseManager.get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id, name, icon FROM categories")
         cats = cursor.fetchall()
         
     buttons = []
     for cat in cats:
-        buttons.append(types.InlineKeyboardButton(f"{cat[2]} {cat[1]}", callback_data=f"cat_show_{cat[0]}"))
+        buttons.append(types.InlineKeyboardButton(f"{cat['icon']} {cat['name']}", callback_data=f"cat_show_{cat['id']}"))
         
     markup.add(*buttons)
     
@@ -198,7 +238,7 @@ def get_main_menu_text(chat_id):
     text += f"📦 عدد الطلبات: *{total_count}*\n\n"
     
     text += "📝 *ملخص الأقسام اليوم:*\n"
-    with sqlite3.connect(DB_FILE) as conn:
+    with DatabaseManager.get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT c.icon, c.name, COUNT(o.id), SUM(o.price)
@@ -227,7 +267,7 @@ def get_main_menu_text(chat_id):
     return text
 
 def record_order(chat_id, category_id, service, price):
-    with sqlite3.connect(DB_FILE) as conn:
+    with DatabaseManager.get_connection() as conn:
         cursor = conn.cursor()
         
         cursor.execute("SELECT COUNT(*) FROM orders WHERE chat_id = ?", (chat_id,))
@@ -243,6 +283,8 @@ def record_order(chat_id, category_id, service, price):
         ''', (chat_id, next_order_id, category_id, service, int(price), now_time, today_str))
         conn.commit()
     
+    # تنظيف وإلغاء أي مهمة مؤقت نشطة
+    cancel_active_job(chat_id)
     update_user_state(chat_id, state="main_menu", clear_pending=True)
     return {
         "id": next_order_id,
@@ -264,6 +306,7 @@ def auto_return_to_main(chat_id, message_id):
         pass
 
 def price_timeout_handler(chat_id, message_id, category_id):
+    """المنفذ التلقائي لتسجيل السعر الافتراضي بعد انقضاء الـ 10 ثوانٍ"""
     data = get_user_state(chat_id)
     if data["state"] == "awaiting_price" and data["pending_order"] and data["last_bot_msg_id"] == message_id:
         po = data["pending_order"]
@@ -294,6 +337,10 @@ def normalize_date(date_str):
             continue
     return date_str
 
+
+# ==========================================
+# 4. Excel & Backup Automation
+# ==========================================
 def auto_daily_backup():
     today_str = datetime.date.today().strftime("%Y-%m-%d")
     current_month = datetime.date.today().strftime("%Y-%m")
@@ -316,25 +363,22 @@ def auto_daily_backup():
         top=Side(style="thin"), bottom=Side(style="thin")
     )
     center_align = Alignment(horizontal="center", vertical="center")
-    right_align = Alignment(horizontal="right", vertical="center")
     
     # Fetch all data
-    with sqlite3.connect(DB_FILE) as conn:
+    with DatabaseManager.get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT order_id_user, service, price, time, date, chat_id, category_id FROM orders ORDER BY date DESC, time DESC")
         all_orders = cursor.fetchall()
         cursor.execute("SELECT id, name, icon FROM categories")
-        categories = {row[0]: f"{row[2]} {row[1]}" for row in cursor.fetchall()}
-        cursor.execute("SELECT id, name, category_id FROM services")
-        services_map = {row[0]: row[1] for row in cursor.fetchall()}
+        categories = {row['id']: f"{row['icon']} {row['name']}" for row in cursor.fetchall()}
     
-    today_orders = [o for o in all_orders if o[4] == today_str]
-    month_orders = [o for o in all_orders if o[4].startswith(current_month)]
-    year_orders = [o for o in all_orders if o[4].startswith(current_year)]
-    total_day_rev = sum(o[2] for o in today_orders)
-    total_month_rev = sum(o[2] for o in month_orders)
-    total_year_rev = sum(o[2] for o in year_orders)
-    total_all_rev = sum(o[2] for o in all_orders)
+    today_orders = [o for o in all_orders if o['date'] == today_str]
+    month_orders = [o for o in all_orders if o['date'].startswith(current_month)]
+    year_orders = [o for o in all_orders if o['date'].startswith(current_year)]
+    total_day_rev = sum(o['price'] for o in today_orders)
+    total_month_rev = sum(o['price'] for o in month_orders)
+    total_year_rev = sum(o['price'] for o in year_orders)
+    total_all_rev = sum(o['price'] for o in all_orders)
     
     # ============================================
     # SHEET 1: DASHBOARD
@@ -393,11 +437,11 @@ def auto_daily_backup():
     
     cat_breakdown = {}
     for o in today_orders:
-        cat_name = categories.get(o[6], "Unknown")
+        cat_name = categories.get(o['category_id'], "Unknown")
         if cat_name not in cat_breakdown:
             cat_breakdown[cat_name] = {"count": 0, "revenue": 0}
         cat_breakdown[cat_name]["count"] += 1
-        cat_breakdown[cat_name]["revenue"] += o[2]
+        cat_breakdown[cat_name]["revenue"] += o['price']
     
     row_idx = 11
     for cat_name, stats in sorted(cat_breakdown.items(), key=lambda x: x[1]["revenue"], reverse=True):
@@ -432,12 +476,12 @@ def auto_daily_backup():
     
     for row_idx, order in enumerate(all_orders, start=2):
         ws_orders.cell(row=row_idx, column=1, value=row_idx-1)
-        ws_orders.cell(row=row_idx, column=2, value=order[1])
-        ws_orders.cell(row=row_idx, column=3, value=categories.get(order[6], "Unknown"))
-        ws_orders.cell(row=row_idx, column=4, value=order[2])
-        ws_orders.cell(row=row_idx, column=5, value=order[3])
-        ws_orders.cell(row=row_idx, column=6, value=order[4])
-        ws_orders.cell(row=row_idx, column=7, value=order[0])
+        ws_orders.cell(row=row_idx, column=2, value=order['service'])
+        ws_orders.cell(row=row_idx, column=3, value=categories.get(order['category_id'], "Unknown"))
+        ws_orders.cell(row=row_idx, column=4, value=order['price'])
+        ws_orders.cell(row=row_idx, column=5, value=order['time'])
+        ws_orders.cell(row=row_idx, column=6, value=order['date'])
+        ws_orders.cell(row=row_idx, column=7, value=order['order_id_user'])
         for col in range(1, 8):
             ws_orders.cell(row=row_idx, column=col).border = thin_border
             ws_orders.cell(row=row_idx, column=col).alignment = center_align
@@ -481,11 +525,11 @@ def auto_daily_backup():
     
     for row_idx, order in enumerate(today_orders, start=4):
         ws_today.cell(row=row_idx, column=1, value=row_idx-3)
-        ws_today.cell(row=row_idx, column=2, value=order[1])
-        ws_today.cell(row=row_idx, column=3, value=categories.get(order[6], "Unknown"))
-        ws_today.cell(row=row_idx, column=4, value=order[2])
-        ws_today.cell(row=row_idx, column=5, value=order[3])
-        ws_today.cell(row=row_idx, column=6, value=order[0])
+        ws_today.cell(row=row_idx, column=2, value=order['service'])
+        ws_today.cell(row=row_idx, column=3, value=categories.get(order['category_id'], "Unknown"))
+        ws_today.cell(row=row_idx, column=4, value=order['price'])
+        ws_today.cell(row=row_idx, column=5, value=order['time'])
+        ws_today.cell(row=row_idx, column=6, value=order['order_id_user'])
         for col in range(1, 7):
             ws_today.cell(row=row_idx, column=col).border = thin_border
             ws_today.cell(row=row_idx, column=col).alignment = center_align
@@ -526,11 +570,11 @@ def auto_daily_backup():
     
     monthly_data = {}
     for o in all_orders:
-        m = o[4][:7]
+        m = o['date'][:7]
         if m not in monthly_data:
             monthly_data[m] = {"count": 0, "revenue": 0}
         monthly_data[m]["count"] += 1
-        monthly_data[m]["revenue"] += o[2]
+        monthly_data[m]["revenue"] += o['price']
     
     row_idx = 4
     prev_rev = 0
@@ -581,11 +625,11 @@ def auto_daily_backup():
     
     service_stats = {}
     for o in all_orders:
-        svc = o[1]
+        svc = o['service']
         if svc not in service_stats:
             service_stats[svc] = {"count": 0, "revenue": 0}
         service_stats[svc]["count"] += 1
-        service_stats[svc]["revenue"] += o[2]
+        service_stats[svc]["revenue"] += o['price']
     
     sorted_services = sorted(service_stats.items(), key=lambda x: x[1]["revenue"], reverse=True)
     for rank, (svc, stats) in enumerate(sorted_services[:20], start=1):
@@ -606,9 +650,7 @@ def auto_daily_backup():
     ws_top.column_dimensions["C"].width = 14
     ws_top.column_dimensions["D"].width = 16
     
-    # ============================================
-    # SAVE & SEND
-    # ============================================
+    # Save & Send
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
@@ -629,16 +671,22 @@ def auto_daily_backup():
     except Exception as e:
         print(f"Failed to send automated backup: {e}")
 
+# جدولة النسخ الاحتياطي التلقائي يومياً قبل نهاية اليوم بدقيقة
 scheduler.add_job(auto_daily_backup, 'cron', hour=23, minute=59)
 
-# --- Command Handlers ---
+
+# ==========================================
+# 5. Telegram Commands & Callback Handlers
+# ==========================================
+
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
     chat_id = message.chat.id
+    cancel_active_job(chat_id)
     update_user_state(chat_id, state="main_menu", clear_pending=True, last_bot_msg_id=0)
     bot.send_message(chat_id, get_main_menu_text(chat_id), reply_markup=get_main_menu_markup())
 
-# --- Callback Query Handlers ---
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callbacks(call):
     chat_id = call.message.chat.id
@@ -646,6 +694,7 @@ def handle_callbacks(call):
     data = get_user_state(chat_id)
     
     if call.data == "main_menu":
+        cancel_active_job(chat_id)
         update_user_state(chat_id, state="main_menu", clear_pending=True)
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=get_main_menu_text(chat_id), reply_markup=get_main_menu_markup())
 
@@ -658,18 +707,18 @@ def handle_callbacks(call):
         cat_id = int(call.data.split("_")[2])
         update_user_state(chat_id, state="service_list", selected_cat_id=cat_id)
         
-        with sqlite3.connect(DB_FILE) as conn:
+        with DatabaseManager.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
             cat_info = cursor.fetchone()
             cursor.execute("SELECT name, price FROM services WHERE category_id = ? AND is_active = 1", (cat_id,))
             services = cursor.fetchall()
             
-        title = f"{cat_info[1]} {cat_info[0]}"
+        title = f"{cat_info['icon']} {cat_info['name']}"
         markup = types.InlineKeyboardMarkup(row_width=1)
         
         for srv in services:
-            markup.add(types.InlineKeyboardButton(f"{srv[0]} — {srv[1]}ج", callback_data=f"srv_{srv[0]}_{srv[1]}"))
+            markup.add(types.InlineKeyboardButton(f"{srv['name']} — {srv['price']}ج", callback_data=f"srv_{srv['name']}_{srv['price']}"))
             
         markup.add(types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"📍 قسم: *{title}*\n\nاضغط لتسجيل الإجراء مباشرة:", reply_markup=markup)
@@ -680,7 +729,16 @@ def handle_callbacks(call):
         default_price = int(parts[2])
         cat_id = data["selected_cat_id"]
         
-        update_user_state(chat_id, state="awaiting_price", pending_order={"service": service_name, "price": default_price}, last_bot_msg_id=msg_id)
+        # توليد معرف عشوائي فريد لمهمة الـ Scheduler لتسهيل تعقبها وإلغائها
+        unique_job_id = f"price_timeout_{chat_id}_{int(datetime.datetime.now().timestamp())}"
+        
+        update_user_state(
+            chat_id, 
+            state="awaiting_price", 
+            pending_order={"service": service_name, "price": default_price}, 
+            last_bot_msg_id=msg_id,
+            active_job_id=unique_job_id
+        )
         
         text = f"💰 *تأكيد السعر*\n\n"
         text += f"🛠️ {service_name}\n"
@@ -693,9 +751,19 @@ def handle_callbacks(call):
             types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")
         )
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-        scheduler.add_job(price_timeout_handler, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=10), args=[chat_id, msg_id, cat_id])
+        
+        # جدولة تسجيل السعر التلقائي
+        scheduler.add_job(
+            price_timeout_handler, 
+            'date', 
+            run_date=datetime.datetime.now() + datetime.timedelta(seconds=10), 
+            args=[chat_id, msg_id, cat_id],
+            id=unique_job_id
+        )
 
     elif call.data == "confirm_default":
+        cancel_active_job(chat_id) # إلغاء الجدولة فوراً لمنع التكرار
+        data = get_user_state(chat_id)
         if data["state"] == "awaiting_price" and data["pending_order"]:
             po = data["pending_order"]
             cat_id = data["selected_cat_id"]
@@ -720,6 +788,7 @@ def handle_callbacks(call):
             types.InlineKeyboardButton("➕ إنشاء قسم جديد تماماً", callback_data="add_category_trigger"),
             types.InlineKeyboardButton("📤 تحميل البيانات فورا (CSV)", callback_data="export_csv"),
             types.InlineKeyboardButton("📥 استعادة البيانات (رفع CSV)", callback_data="import_csv_trigger"),
+            types.InlineKeyboardButton("🗑️ حذف قسم", callback_data="remove_category_trigger"),
             types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu")
         )
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
@@ -728,15 +797,16 @@ def handle_callbacks(call):
         text = "⚙️ *لوحة تحكم الأقسام والخدمات*\n\nاختار القسم لتعديل أسعاره أو إضافة خدمة جديدة داخله:"
         markup = types.InlineKeyboardMarkup(row_width=1)
         
-        with sqlite3.connect(DB_FILE) as conn:
+        with DatabaseManager.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT id, name, icon FROM categories")
             cats = cursor.fetchall()
             
         for cat in cats:
-            markup.add(types.InlineKeyboardButton(f"إدارة: {cat[2]} {cat[1]}", callback_data=f"setcat_{cat[0]}"))
+            markup.add(types.InlineKeyboardButton(f"إدارة: {cat['icon']} {cat['name']}", callback_data=f"setcat_{cat['id']}"))
             
         markup.add(types.InlineKeyboardButton("🔙 رجوع للخلف", callback_data="backup_menu"))
+        markup.add(types.InlineKeyboardButton("🗑️ حذف خدمة", callback_data="remove_service_trigger"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
     elif call.data == "add_category_trigger":
@@ -746,31 +816,51 @@ def handle_callbacks(call):
         markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="backup_menu"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
+    elif call.data == "remove_category_trigger":
+        update_user_state(chat_id, state="awaiting_remove_category", last_bot_msg_id=msg_id)
+        text = "🗑️ *حذف قسم*\n\nاختار القسم المراد حذفه:"
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        
+        with DatabaseManager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name, icon FROM categories")
+            cats = cursor.fetchall()
+            
+        if not cats:
+            text = "❌ لا توجد أقسام لحذفها."
+            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="backup_menu"))
+            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+            return
+            
+        for cat in cats:
+            markup.add(types.InlineKeyboardButton(f"🗑️ {cat['icon']} {cat['name']}", callback_data=f"delcat_{cat['id']}"))
+            
+        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="backup_menu"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+
     elif call.data.startswith("setcat_"):
         cat_id = int(call.data.split("_")[1])
         update_user_state(chat_id, selected_cat_id=cat_id)
         
-        with sqlite3.connect(DB_FILE) as conn:
+        with DatabaseManager.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
             cat_info = cursor.fetchone()
             cursor.execute("SELECT id, name, price FROM services WHERE category_id = ? AND is_active = 1", (cat_id,))
             services = cursor.fetchall()
             
-        text = f"⚙️ *تعديل قسم: {cat_info[1]} {cat_info[0]}*\n\n"
+        text = f"⚙️ *تعديل قسم: {cat_info['icon']} {cat_info['name']}*\n\n"
         text += "الخدمات الحالية المسجلة:\n"
         if not services:
             text += "  لا توجد خدمات في هذا القسم بعد.\n"
         for s in services:
-            text += f"• {s[1]} — {s[2]}ج\n"
+            text += f"• {s['name']} — {s['price']}ج\n"
             
         text += "\n➕ لإضافة خدمة جديدة لهذا القسم اضغط على الزر بالأسفل."
         
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(
             types.InlineKeyboardButton("➕ إضافة خدمة / إجراء جديد", callback_data="add_service_trigger"),
-            types.InlineKeyboardButton("🗑️ حذف القسم", callback_data="remove_this_category"),
-            types.InlineKeyboardButton("🗑️ حذف خدمة", callback_data="remove_service_trigger"),
             types.InlineKeyboardButton("🔙 رجوع للضبط", callback_data="settings_main")
         )
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
@@ -782,71 +872,33 @@ def handle_callbacks(call):
         markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="settings_main"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
-    elif call.data == "remove_this_category":
-        cat_id = data["selected_cat_id"]
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
-            cat_info = cursor.fetchone()
-        text = f"⚠️ *تأكيد حذف القسم*\n\nهل أنت متأكد من حذف هذا القسم بالكامل؟\n\n📂 {cat_info[1]} {cat_info[0]}\n\n❗ سيتم إلغاء تفعيل جميع الخدمات بداخله. الطلبات السابقة ستبقى محفوظة."
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            types.InlineKeyboardButton("✅ نعم، احذف", callback_data="confirm_delcat_now"),
-            types.InlineKeyboardButton("❌ لا، تراجع", callback_data=f"setcat_{cat_id}")
-        )
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-
-    elif call.data == "confirm_delcat_now":
-        cat_id = data["selected_cat_id"]
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
-            cat_info = cursor.fetchone()
-            cursor.execute("UPDATE services SET is_active = 0 WHERE category_id = ?", (cat_id,))
-            cursor.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
-            conn.commit()
-        update_user_state(chat_id, selected_cat_id=None)
-        text = f"🗑️ *تم حذف القسم بنجاح!*\n\n📂 {cat_info[1]} {cat_info[0]}\n\n⏳ رجوع تلقائي..."
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 رجوع للضبط", callback_data="settings_main"))
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-        scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
-
     elif call.data == "remove_service_trigger":
         cat_id = data["selected_cat_id"]
-        with sqlite3.connect(DB_FILE) as conn:
+        if not cat_id:
+            bot.answer_callback_query(call.id, "رجاءً قم باختيار القسم أولاً!", show_alert=True)
+            return
+
+        with DatabaseManager.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
             cat_info = cursor.fetchone()
             cursor.execute("SELECT id, name, price FROM services WHERE category_id = ? AND is_active = 1", (cat_id,))
             services = cursor.fetchall()
             
-        text = f"🗑️ *حذف خدمة من قسم: {cat_info[1]} {cat_info[0]}*\n\nاختار الخدمة المراد حذفها:"
+        text = f"🗑️ *حذف خدمة من قسم: {cat_info['icon']} {cat_info['name']}*\n\nاختار الخدمة المراد حذفها:"
         markup = types.InlineKeyboardMarkup(row_width=1)
         
         if not services:
             text = "❌ لا توجد خدمات في هذا القسم لحذفها."
             markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_main"))
             bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-        else:
-            for srv in services:
-                markup.add(types.InlineKeyboardButton(f"🗑️ {srv[1]} — {srv[2]}ج", callback_data=f"delsrv_{srv[0]}"))
-            markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="settings_main"))
-            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-
-    elif call.data.startswith("delsrv_"):
-        srv_id = int(call.data.split("_")[1])
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, price FROM services WHERE id = ?", (srv_id,))
-            srv_info = cursor.fetchone()
-            cursor.execute("UPDATE services SET is_active = 0 WHERE id = ?", (srv_id,))
-            conn.commit()
-        text = f"🗑️ *تم حذف الخدمة بنجاح!*\n\n🛠️ {srv_info[0]} — {srv_info[1]}ج\n\n⏳ رجوع تلقائي..."
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_main"))
+            return
+            
+        for srv in services:
+            markup.add(types.InlineKeyboardButton(f"🗑️ {srv['name']} — {srv['price']}ج", callback_data=f"delsrv_{srv['id']}"))
+            
+        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="settings_main"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-        scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
 
     elif call.data == "rep_today":
         today_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -906,6 +958,25 @@ def handle_callbacks(call):
         markup.add(types.InlineKeyboardButton("🔙 رجوع للتقارير", callback_data="menu_reports"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
+    elif call.data.startswith("delcat_"):
+        cat_id = int(call.data.split("_")[1])
+        
+        with DatabaseManager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
+            cat_info = cursor.fetchone()
+            
+            # تعطيل الخدمات التابعة وحذف القسم
+            cursor.execute("UPDATE services SET is_active = 0 WHERE category_id = ?", (cat_id,))
+            cursor.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
+            conn.commit()
+            
+        text = f"🗑️ *تم حذف القسم بنجاح!*\n\n📂 {cat_info['icon']} {cat_info['name']}\n\n⏳ رجوع تلقائي..."
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="backup_menu"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+        scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
+
     elif call.data == "confirm_delete":
         orders = get_user_orders(chat_id)
         if not orders:
@@ -925,7 +996,7 @@ def handle_callbacks(call):
         orders = get_user_orders(chat_id)
         if orders:
             last_order = orders[-1]
-            with sqlite3.connect(DB_FILE) as conn:
+            with DatabaseManager.get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM orders WHERE chat_id = ? AND order_id_user = ?", (chat_id, last_order["id"]))
                 conn.commit()
@@ -936,15 +1007,40 @@ def handle_callbacks(call):
             bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
             scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
 
+    elif call.data.startswith("delsrv_"):
+        srv_id = int(call.data.split("_")[1])
+        
+        with DatabaseManager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, price FROM services WHERE id = ?", (srv_id,))
+            srv_info = cursor.fetchone()
+            cursor.execute("UPDATE services SET is_active = 0 WHERE id = ?", (srv_id,))
+            conn.commit()
+            
+        text = f"🗑️ *تم حذف الخدمة بنجاح!*\n\n🛠️ {srv_info['name']} — {srv_info['price']}ج\n\n⏳ رجوع تلقائي..."
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_main"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+        scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
+
     elif call.data == "export_csv":
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         orders = get_user_orders(chat_id)
+        
+        # استخراج أسماء الفئات المتاحة لربطها بالـ CSV
+        with DatabaseManager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name FROM categories")
+            categories_map = {row['id']: row['name'] for row in cursor.fetchall()}
+
         csv_buffer = io.StringIO()
-        csv_buffer.write('\ufeff')
+        csv_buffer.write('\ufeff') # كود الترميز لضمان قراءة اللغة العربية بشكل صحيح في Excel
         writer = csv.writer(csv_buffer)
-        writer.writerow(["رقم الطلب", "نوع الخدمة", "السعر", "الوقت", "التاريخ"])
+        writer.writerow(["رقم الطلب", "نوع الخدمة", "السعر", "الوقت", "التاريخ", "القسم"])
         for o in orders:
-            writer.writerow([o["id"], o["service"], o["price"], o["time"], o["date"]])
+            cat_name = categories_map.get(o.get("category_id"), "")
+            writer.writerow([o["id"], o["service"], o["price"], o["time"], o["date"], cat_name])
+            
         csv_buffer.seek(0)
         bio = io.BytesIO(csv_buffer.getvalue().encode('utf-8'))
         bio.name = f"تقرير_الشغل_{chat_id}_{today_str}.csv"
@@ -961,7 +1057,10 @@ def handle_callbacks(call):
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
 
-# --- Message Handling ---
+# ==========================================
+# 6. Message Processing & Input Handlers
+# ==========================================
+
 @bot.message_handler(content_types=['text', 'document'])
 def handle_all_messages(message):
     chat_id = message.chat.id
@@ -979,7 +1078,7 @@ def handle_all_messages(message):
                 cat_name = cat_name.strip()
                 cat_icon = cat_icon.strip()
                 
-                with sqlite3.connect(DB_FILE) as conn:
+                with DatabaseManager.get_connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute("INSERT INTO categories (name, icon) VALUES (?, ?)", (cat_name, cat_icon))
                     conn.commit()
@@ -1008,7 +1107,7 @@ def handle_all_messages(message):
                 cat_id = data["selected_cat_id"]
                 
                 if cat_id:
-                    with sqlite3.connect(DB_FILE) as conn:
+                    with DatabaseManager.get_connection() as conn:
                         cursor = conn.cursor()
                         cursor.execute("INSERT INTO services (category_id, name, price) VALUES (?, ?, ?)", (cat_id, srv_name, srv_price))
                         conn.commit()
@@ -1039,14 +1138,27 @@ def handle_all_messages(message):
                 if not header or "نوع الخدمة" not in header or "السعر" not in header:
                     raise ValueError("الملف المرفوع لا يطابق الهيكلية المطلوبة.")
                 
+                # جلب خريطة الفئات المسجلة حالياً لربطها بذكاء بدلاً من فرض الرقم 1
+                with DatabaseManager.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id, name FROM categories")
+                    existing_cats = {row['name'].strip(): row['id'] for row in cursor.fetchall()}
+                
                 valid_rows = []
                 for row in reader:
+                    # التحقق من احتواء الملف على عمود "القسم" ومحاولة مطابقته ديناميكياً
+                    cat_id = 1 # قيمة افتراضية احتياطية
+                    if len(row) >= 6:
+                        csv_cat_name = row[5].strip()
+                        if csv_cat_name in existing_cats:
+                            cat_id = existing_cats[csv_cat_name]
+                    
                     if len(row) >= 5:
                         clean_date = normalize_date(row[4])
-                        valid_rows.append((chat_id, int(row[0]), 1, row[1], int(row[2]), row[3], clean_date))
+                        valid_rows.append((chat_id, int(row[0]), cat_id, row[1], int(row[2]), row[3], clean_date))
                 
                 if valid_rows:
-                    with sqlite3.connect(DB_FILE) as conn:
+                    with DatabaseManager.get_connection() as conn:
                         cursor = conn.cursor()
                         cursor.execute("DELETE FROM orders WHERE chat_id = ?", (chat_id,))
                         cursor.executemany('''
@@ -1054,7 +1166,7 @@ def handle_all_messages(message):
                             VALUES (?, ?, ?, ?, ?, ?, ?)
                         ''', valid_rows)
                         conn.commit()
-                    text = f"✨ *تم استعادة البيانات لعدد {len(valid_rows)} طلب!*"
+                    text = f"✨ *تم استعادة البيانات لعدد {len(valid_rows)} طلب بنجاح!*"
                 else:
                     text = "❌ الملف المرفوع لا يحتوي على سجلات صالحة."
             except Exception as e:
@@ -1072,6 +1184,7 @@ def handle_all_messages(message):
     elif data["state"] == "awaiting_price" and data["pending_order"] and message.content_type == 'text':
         text_clean = message.text.strip()
         if text_clean.isdigit():
+            cancel_active_job(chat_id) # إلغاء الـ timeout المجدول فوراً بمجرد كتابة السعر
             custom_price = int(text_clean)
             po = data["pending_order"]
             cat_id = data["selected_cat_id"]
@@ -1092,10 +1205,36 @@ def handle_all_messages(message):
                 scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, sent.message_id])
             return
 
+    # تنظيف أي رسالة عشوائية يرسلها المستخدم خارج النطاق الصحيح
     try: bot.delete_message(chat_id, message.message_id)
     except Exception: pass
 
-# --- Start Bot ---
+
+# ==========================================
+# 7. Render Deployment Health Checker
+# ==========================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'OK')
+    def log_message(self, format, *args):
+        pass # إسكات سجلات الاتصال لتجنب إغراق شاشة الـ Console
+
+def run_health_server():
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    server.serve_forever()
+
+# تشغيل خادم فحص الحالة في خلفية منفصلة
+threading.Thread(target=run_health_server, daemon=True).start()
+
+
+# ==========================================
+# 8. Entry Point
+# ==========================================
+
 if __name__ == '__main__':
-    print("Bot is running...")
+    print("Bot is up and running successfully...")
     bot.infinity_polling()
