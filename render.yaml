@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: wash-and-scan-bot
     runtime: python
     plan: free
@@ -10,3 +10,5 @@ services:
         sync: false
       - key: ADMIN_CHAT_ID
         sync: false
+      - key: PORT
+        value: 10000
