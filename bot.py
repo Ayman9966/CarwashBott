@@ -401,6 +401,7 @@ def handle_callbacks(call):
             types.InlineKeyboardButton("➕ إنشاء قسم جديد تماماً", callback_data="add_category_trigger"),
             types.InlineKeyboardButton("📤 تحميل البيانات فورا (CSV)", callback_data="export_csv"),
             types.InlineKeyboardButton("📥 استعادة البيانات (رفع CSV)", callback_data="import_csv_trigger"),
+            types.InlineKeyboardButton("🗑️ حذف قسم", callback_data="remove_category_trigger"),
             types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu")
         )
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
@@ -418,6 +419,7 @@ def handle_callbacks(call):
             markup.add(types.InlineKeyboardButton(f"إدارة: {cat[2]} {cat[1]}", callback_data=f"setcat_{cat[0]}"))
             
         markup.add(types.InlineKeyboardButton("🔙 رجوع للخلف", callback_data="backup_menu"))
+        markup.add(types.InlineKeyboardButton("🗑️ حذف خدمة", callback_data="remove_service_trigger"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
     elif call.data == "add_category_trigger":
@@ -427,6 +429,31 @@ def handle_callbacks(call):
         markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="backup_menu"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
+
+    elif call.data == "remove_category_trigger":
+        update_user_state(chat_id, state="awaiting_remove_category", last_bot_msg_id=msg_id)
+        text = "🗑️ *حذف قسم*\n\nاختار القسم المراد حذفه:"
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, name, icon FROM categories")
+            cats = cursor.fetchall()
+            
+        if not cats:
+            text = "❌ لا توجد أقسام لحذفها."
+            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="backup_menu"))
+            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+            i += 1
+            continue
+            
+        for cat in cats:
+            markup.add(types.InlineKeyboardButton(f"🗑️ {cat[2]} {cat[1]}", callback_data=f"delcat_{cat[0]}"))
+            
+        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="backup_menu"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+        i += 1
+        continue
     elif call.data.startswith("setcat_"):
         cat_id = int(call.data.split("_")[1])
         update_user_state(chat_id, selected_cat_id=cat_id)
@@ -461,6 +488,34 @@ def handle_callbacks(call):
         markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="settings_main"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
+
+    elif call.data == "remove_service_trigger":
+        cat_id = data["selected_cat_id"]
+        
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
+            cat_info = cursor.fetchone()
+            cursor.execute("SELECT id, name, price FROM services WHERE category_id = ? AND is_active = 1", (cat_id,))
+            services = cursor.fetchall()
+            
+        text = f"🗑️ *حذف خدمة من قسم: {cat_info[1]} {cat_info[0]}*\n\nاختار الخدمة المراد حذفها:"
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        
+        if not services:
+            text = "❌ لا توجد خدمات في هذا القسم لحذفها."
+            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_main"))
+            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+            i += 1
+            continue
+            
+        for srv in services:
+            markup.add(types.InlineKeyboardButton(f"🗑️ {srv[1]} — {srv[2]}ج", callback_data=f"delsrv_{srv[0]}"))
+            
+        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="settings_main"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+        i += 1
+        continue
     elif call.data == "rep_today":
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         orders = get_user_orders(chat_id)
@@ -519,6 +574,27 @@ def handle_callbacks(call):
         markup.add(types.InlineKeyboardButton("🔙 رجوع للتقارير", callback_data="menu_reports"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
+
+    elif call.data.startswith("delcat_"):
+        cat_id = int(call.data.split("_")[1])
+        
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
+            cat_info = cursor.fetchone()
+            
+            # Soft delete: deactivate services first, then delete category
+            cursor.execute("UPDATE services SET is_active = 0 WHERE category_id = ?", (cat_id,))
+            cursor.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
+            conn.commit()
+            
+        text = f"🗑️ *تم حذف القسم بنجاح!*\n\n📂 {cat_info[1]} {cat_info[0]}\n\n⏳ رجوع تلقائي..."
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="backup_menu"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+        scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
+        i += 1
+        continue
     elif call.data == "confirm_delete":
         orders = get_user_orders(chat_id)
         if not orders:
@@ -549,6 +625,24 @@ def handle_callbacks(call):
             bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
             scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
 
+
+    elif call.data.startswith("delsrv_"):
+        srv_id = int(call.data.split("_")[1])
+        
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, price FROM services WHERE id = ?", (srv_id,))
+            srv_info = cursor.fetchone()
+            cursor.execute("UPDATE services SET is_active = 0 WHERE id = ?", (srv_id,))
+            conn.commit()
+            
+        text = f"🗑️ *تم حذف الخدمة بنجاح!*\n\n🛠️ {srv_info[0]} — {srv_info[1]}ج\n\n⏳ رجوع تلقائي..."
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_main"))
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+        scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
+        i += 1
+        continue
     elif call.data == "export_csv":
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         orders = get_user_orders(chat_id)
