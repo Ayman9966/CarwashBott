@@ -7,6 +7,7 @@ import time
 import requests
 import re
 import threading
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telebot import TeleBot, types
@@ -33,6 +34,31 @@ executor = ThreadPoolExecutor(max_workers=4)
 SERVICES_CACHE = []
 CACHE_TIMESTAMP = 0
 CACHE_VALIDITY = 300  # 5 minutes
+
+# --- Service lookup cache for callback decoding ---
+# Maps short callback IDs to full service data
+SERVICE_CALLBACK_MAP = {}
+
+def build_service_callback_map():
+    """Build a map of short IDs to full service data for callback decoding"""
+    global SERVICE_CALLBACK_MAP
+    SERVICE_CALLBACK_MAP = {}
+    services = fetch_services_from_google_sheets()
+    
+    for item in services:
+        dept = item.get("department", "")
+        svc = item.get("service", "")
+        price = item.get("price", 0)
+        # Create a short unique key: first 3 chars of dept + first 3 of service + price
+        # Use hash for guaranteed uniqueness
+        key_str = f"{dept}|{svc}|{price}"
+        short_id = hashlib.md5(key_str.encode('utf-8')).hexdigest()[:8]
+        SERVICE_CALLBACK_MAP[short_id] = {
+            "department": dept,
+            "service": svc,
+            "price": price
+        }
+    return SERVICE_CALLBACK_MAP
 
 # --- Database Initialization ---
 def init_db():
@@ -349,7 +375,6 @@ def get_user_orders(chat_id):
     )
 
 def get_last_5_orders(chat_id):
-    """Get last 5 orders for the user, newest first"""
     return db_execute(
         "SELECT order_id_user, department, service, price, time, date FROM orders WHERE chat_id = ? ORDER BY id DESC LIMIT 5",
         (chat_id,), fetchall=True
@@ -373,12 +398,17 @@ def get_departments_markup():
     
     markup.add(*buttons)
     markup.add(types.InlineKeyboardButton("📊 التقارير", callback_data="menu_reports"))
+    markup.add(types.InlineKeyboardButton("📋 آخر 5 تسجيلات", callback_data="last_5_records"))
     
     return markup
 
 def get_services_by_department_markup(department):
+    """Create inline keyboard for services using SHORT callback data to avoid Telegram 64-byte limit"""
     services = fetch_services_from_google_sheets()
     dept_services = [s for s in services if s.get("department") == department]
+    
+    # Rebuild callback map to ensure fresh data
+    build_service_callback_map()
     
     markup = types.InlineKeyboardMarkup(row_width=1)
     
@@ -386,7 +416,13 @@ def get_services_by_department_markup(department):
         svc_name = svc.get("service", "Unknown")
         price = svc.get("price", 0)
         button_text = f"{svc_name} • {price}ج"
-        button = types.InlineKeyboardButton(button_text, callback_data=f"service_{department}_{svc_name}_{price}")
+        
+        # Use short hash ID instead of full names
+        key_str = f"{department}|{svc_name}|{price}"
+        short_id = hashlib.md5(key_str.encode('utf-8')).hexdigest()[:8]
+        
+        callback = f"srv_{short_id}"
+        button = types.InlineKeyboardButton(button_text, callback_data=callback)
         markup.add(button)
     
     markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
@@ -485,34 +521,53 @@ def handle_callback(call):
         update_user_state(chat_id, state="selecting_service", pending_department=department)
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
     
-    elif call.data.startswith("service_"):
-        parts = call.data.split("_", 3)
-        department = parts[1]
-        service = parts[2]
-        price = int(parts[3])
+    # --- FIXED: Service selection using short hash IDs ---
+    elif call.data.startswith("srv_"):
+        short_id = call.data.replace("srv_", "")
         
-        order = record_order(chat_id, department, service, price)
+        # Ensure map is built
+        if not SERVICE_CALLBACK_MAP:
+            build_service_callback_map()
         
-        text = f"✅ *تم التسجيل #{order['id']}*\n\n"
-        text += f"📦 {order['department']}\n"
-        text += f"🛠️ {order['service']}\n"
-        text += f"💰 {order['price']}ج\n\n"
-        text += "⏳ رجوع تلقائي..."
+        service_data = SERVICE_CALLBACK_MAP.get(short_id)
         
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
+        if not service_data:
+            # Try rebuilding map in case data changed
+            build_service_callback_map()
+            service_data = SERVICE_CALLBACK_MAP.get(short_id)
         
-        update_user_state(chat_id, state="main_menu", clear_pending=True)
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-        
-        scheduler.add_job(
-            auto_return_to_main,
-            'date',
-            run_date=datetime.datetime.now() + datetime.timedelta(seconds=1.5),
-            args=[chat_id, msg_id]
-        )
+        if service_data:
+            department = service_data["department"]
+            service = service_data["service"]
+            price = service_data["price"]
+            
+            order = record_order(chat_id, department, service, price)
+            
+            text = f"✅ *تم التسجيل #{order['id']}*\n\n"
+            text += f"📦 {order['department']}\n"
+            text += f"🛠️ {order['service']}\n"
+            text += f"💰 {order['price']}ج\n\n"
+            text += "⏳ رجوع تلقائي..."
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
+            
+            update_user_state(chat_id, state="main_menu", clear_pending=True)
+            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+            
+            scheduler.add_job(
+                auto_return_to_main,
+                'date',
+                run_date=datetime.datetime.now() + datetime.timedelta(seconds=1.5),
+                args=[chat_id, msg_id]
+            )
+        else:
+            # Fallback: show error and return to main menu
+            text = "❌ *خطأ*\n\nلم يتم العثور على الخدمة، جاري العودة..."
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
+            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
     
-    # --- NEW: Last 5 Records Handler ---
     elif call.data == "last_5_records":
         last_orders = get_last_5_orders(chat_id)
         
@@ -748,6 +803,7 @@ if __name__ == '__main__':
     print("🚀 Bot is starting...")
     
     fetch_services_from_google_sheets()
+    build_service_callback_map()
     
-    print("✅ Bot is running — Last 5 Records + Date-safe restore")
+    print("✅ Bot is running — Short Callback IDs + All Features")
     bot.infinity_polling()
