@@ -76,109 +76,157 @@ def init_db():
 
 init_db()
 
-# --- Connection pool for SQLite ---
-_db_local = threading.local()
+# --- Connection management ---
+_db_lock = threading.Lock()
 
-def get_db_conn():
-    if not hasattr(_db_local, 'conn') or _db_local.conn is None:
-        _db_local.conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    return _db_local.conn
+def db_execute(query, params=(), fetch=False, fetchall=False, commit=True):
+    """Thread-safe DB execution with automatic connection handling"""
+    with _db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row if fetchall else None
+        cursor = conn.cursor()
+        try:
+            cursor.execute(query, params)
+            if commit:
+                conn.commit()
+            if fetchall:
+                result = [dict(r) for r in cursor.fetchall()]
+                return result
+            if fetch:
+                result = cursor.fetchone()
+                return result
+            return cursor.lastrowid
+        except Exception as e:
+            conn.rollback()
+            raise e
+        finally:
+            conn.close()
 
 # --- Google Sheets Integration ---
 def fetch_services_from_google_sheets():
     global SERVICES_CACHE, CACHE_TIMESTAMP
     
     current_time = time.time()
-    
     if SERVICES_CACHE and (current_time - CACHE_TIMESTAMP) < CACHE_VALIDITY:
         return SERVICES_CACHE
     
     try:
-        response = requests.get(GOOGLE_APPS_SCRIPT_URL, timeout=3)
+        response = requests.get(GOOGLE_APPS_SCRIPT_URL, timeout=5)
         response.raise_for_status()
         data = response.json()
-        
         SERVICES_CACHE = data
         CACHE_TIMESTAMP = current_time
         print(f"✅ Loaded {len(data)} services from Google Sheets")
         return data
     except Exception as e:
-        print(f"❌ Error fetching from Google Sheets: {e}")
+        print(f"❌ Error fetching services: {e}")
         return SERVICES_CACHE
 
 def fetch_orders_from_google_sheets():
     try:
         url = f"{GOOGLE_APPS_SCRIPT_URL}?action=getOrders"
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=15)
         response.raise_for_status()
         data = response.json()
         
-        print(f"📥 Raw restore data sample: {data[:2] if data else 'EMPTY'}...")
-        
         if isinstance(data, list):
-            print(f"✅ Fetched {len(data)} orders from Google Sheets")
+            print(f"📥 Fetched {len(data)} orders from Sheets")
             return data
+        print(f"⚠️ Unexpected response format: {type(data)}")
         return []
     except Exception as e:
-        print(f"❌ Error fetching orders from Google Sheets: {e}")
+        print(f"❌ Error fetching orders: {e}")
         return []
 
-def restore_orders_from_sheets(chat_id=None):
-    """Restore all orders from Google Sheets into SQLite. If chat_id provided, restore only that user's orders."""
+def restore_orders_from_sheets(target_chat_id=None):
+    """
+    Restore orders from Google Sheets into SQLite.
+    Uses direct DB connection (not thread-local pool) to avoid isolation issues.
+    """
     orders = fetch_orders_from_google_sheets()
     if not orders:
-        return 0, "لا توجد بيانات للاستعادة"
+        return 0, "❌ لا توجد بيانات في Google Sheets"
     
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    
-    # Clear existing orders (optionally filter by chat_id for targeted restore)
-    if chat_id:
-        cursor.execute("DELETE FROM orders WHERE chat_id = ?", (chat_id,))
+    # Use the same db_execute function for consistency
+    # First, clear existing orders for this user (or all if target_chat_id is None)
+    if target_chat_id:
+        db_execute("DELETE FROM orders WHERE chat_id = ?", (target_chat_id,))
     else:
-        cursor.execute("DELETE FROM orders")
+        db_execute("DELETE FROM orders")
     
     restored_count = 0
     skipped = 0
+    errors = []
     
     for order in orders:
         try:
-            raw_chat_id = str(order.get("chatId", "0")).replace('.0', '').strip()
-            order_chat_id = int(raw_chat_id) if raw_chat_id else 0
+            # Parse chatId - handle string, int, float, scientific notation
+            raw_chat_id = order.get("chatId", order.get("id", "0"))
+            if raw_chat_id is None:
+                raw_chat_id = "0"
+            # Convert to string and clean
+            chat_id_str = str(raw_chat_id).strip()
+            # Remove .0 suffix and scientific notation artifacts
+            chat_id_str = chat_id_str.replace('.0', '').replace('e+', '').replace('E+', '')
+            # Remove any non-digit characters
+            chat_id_str = ''.join(c for c in chat_id_str if c.isdigit() or c == '-')
+            order_chat_id = int(chat_id_str) if chat_id_str else 0
             
-            # If restoring for specific user, skip others
-            if chat_id and order_chat_id != chat_id:
+            # Skip if filtering by user and doesn't match
+            if target_chat_id and order_chat_id != target_chat_id:
                 continue
-                
+            
             if order_chat_id == 0:
                 skipped += 1
                 continue
             
+            # Parse other fields with fallbacks
             order_id_user = int(order.get("num", 0))
-            department = str(order.get("department", ""))
-            service = str(order.get("service", ""))
-            price = int(order.get("price", 0))
-            date_str = str(order.get("date", ""))
-            time_str = str(order.get("time", ""))
+            department = str(order.get("department", "")).strip()
+            service = str(order.get("service", "")).strip()
+            price = int(float(order.get("price", 0)))
             
-            cursor.execute('''
+            # Date handling - normalize various formats
+            date_raw = str(order.get("date", "")).strip()
+            if not date_raw:
+                date_raw = datetime.date.today().strftime("%Y-%m-%d")
+            # Ensure YYYY-MM-DD format
+            try:
+                # Try parsing various formats
+                for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d"):
+                    try:
+                        parsed = datetime.datetime.strptime(date_raw, fmt)
+                        date_raw = parsed.strftime("%Y-%m-%d")
+                        break
+                    except ValueError:
+                        continue
+            except:
+                pass
+            
+            time_raw = str(order.get("time", "")).strip()
+            if not time_raw:
+                time_raw = datetime.datetime.now().strftime("%H:%M:%S")
+            
+            # Insert using db_execute for consistency
+            db_execute('''
                 INSERT INTO orders (chat_id, order_id_user, department, service, price, time, date)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (order_chat_id, order_id_user, department, service, price, time_str, date_str))
+            ''', (order_chat_id, order_id_user, department, service, price, time_raw, date_raw))
+            
             restored_count += 1
+            
         except Exception as e:
-            print(f"⚠️ Skipped invalid order row: {e}")
+            errors.append(str(e))
             skipped += 1
             continue
     
-    conn.commit()
-    conn.close()
-    
     msg = f"✅ تم استعادة *{restored_count}* طلب"
     if skipped > 0:
-        msg += f"\n⚠️ تم تخطي *{skipped}* سجل غير صالح"
+        msg += f"\n⚠️ تم تخطي *{skipped}* سجل"
+    if errors:
+        msg += f"\n❌ أخطاء: {errors[:3]}"
     
-    print(f"✅ Restored {restored_count} orders into SQLite")
+    print(f"✅ Restore complete: {restored_count} restored, {skipped} skipped")
     return restored_count, msg
 
 def _async_log_to_sheets(department, service, price, chat_id):
@@ -190,9 +238,9 @@ def _async_log_to_sheets(department, service, price, chat_id):
             "price": price,
             "date": now.strftime("%Y-%m-%d"),
             "time": now.strftime("%H:%M:%S"),
-            "chatId": chat_id
+            "chatId": str(chat_id)
         }
-        response = requests.post(GOOGLE_APPS_SCRIPT_URL, json=payload, timeout=8)
+        response = requests.post(GOOGLE_APPS_SCRIPT_URL, json=payload, timeout=10)
         response.raise_for_status()
     except Exception as e:
         print(f"❌ Async Sheets log failed: {e}")
@@ -202,17 +250,13 @@ def log_order_to_google_sheets(department, service, price, chat_id):
 
 # --- Helper Functions ---
 def get_user_state(chat_id):
-    conn = get_db_conn()
-    cursor = conn.cursor()
-    cursor.execute(
+    row = db_execute(
         "SELECT state, pending_service, pending_department, pending_price, master_msg_id FROM user_states WHERE chat_id = ?",
-        (chat_id,)
+        (chat_id,), fetch=True
     )
-    row = cursor.fetchone()
     
     if not row:
-        cursor.execute("INSERT INTO user_states (chat_id) VALUES (?)", (chat_id,))
-        conn.commit()
+        db_execute("INSERT INTO user_states (chat_id) VALUES (?)", (chat_id,))
         return {
             "state": "main_menu",
             "pending_order": None,
@@ -234,40 +278,34 @@ def get_user_state(chat_id):
     }
 
 def update_user_state(chat_id, state=None, pending_order=None, pending_department=None, master_msg_id=None, clear_pending=False):
-    conn = get_db_conn()
-    cursor = conn.cursor()
     if state:
-        cursor.execute("UPDATE user_states SET state = ? WHERE chat_id = ?", (state, chat_id))
+        db_execute("UPDATE user_states SET state = ? WHERE chat_id = ?", (state, chat_id))
     if master_msg_id is not None:
-        cursor.execute("UPDATE user_states SET master_msg_id = ? WHERE chat_id = ?", (master_msg_id, chat_id))
+        db_execute("UPDATE user_states SET master_msg_id = ? WHERE chat_id = ?", (master_msg_id, chat_id))
     if pending_department:
-        cursor.execute("UPDATE user_states SET pending_department = ? WHERE chat_id = ?", (pending_department, chat_id))
+        db_execute("UPDATE user_states SET pending_department = ? WHERE chat_id = ?", (pending_department, chat_id))
     if pending_order:
-        cursor.execute(
+        db_execute(
             "UPDATE user_states SET pending_service = ?, pending_price = ? WHERE chat_id = ?",
             (pending_order["service"], pending_order["price"], chat_id)
         )
     if clear_pending:
-        cursor.execute(
+        db_execute(
             "UPDATE user_states SET pending_service = NULL, pending_price = NULL, pending_department = NULL WHERE chat_id = ?",
             (chat_id,)
         )
-    conn.commit()
 
 def record_order(chat_id, department, service, price):
     now = datetime.datetime.now()
     
-    conn = get_db_conn()
-    cursor = conn.cursor()
-    cursor.execute("SELECT MAX(order_id_user) FROM orders WHERE chat_id = ?", (chat_id,))
-    last_id = cursor.fetchone()[0]
-    next_id = (last_id or 0) + 1
+    row = db_execute("SELECT MAX(order_id_user) FROM orders WHERE chat_id = ?", (chat_id,), fetch=True)
+    last_id = row[0] if row and row[0] else 0
+    next_id = last_id + 1
     
-    cursor.execute('''
+    db_execute('''
         INSERT INTO orders (chat_id, order_id_user, department, service, price, time, date)
         VALUES (?, ?, ?, ?, ?, ?, ?)
     ''', (chat_id, next_id, department, service, price, now.strftime("%H:%M:%S"), now.strftime("%Y-%m-%d")))
-    conn.commit()
     
     log_order_to_google_sheets(department, service, price, chat_id)
     
@@ -281,15 +319,10 @@ def record_order(chat_id, department, service, price):
     }
 
 def get_user_orders(chat_id):
-    conn = get_db_conn()
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute(
+    return db_execute(
         "SELECT id, order_id_user, department, service, price, time, date FROM orders WHERE chat_id = ? ORDER BY id ASC",
-        (chat_id,)
+        (chat_id,), fetchall=True
     )
-    rows = cursor.fetchall()
-    return [dict(r) for r in rows]
 
 def get_departments_markup():
     services = fetch_services_from_google_sheets()
@@ -331,7 +364,7 @@ def get_services_by_department_markup(department):
 def get_main_menu_text(chat_id):
     today_str = datetime.date.today().strftime("%Y-%m-%d")
     orders = get_user_orders(chat_id)
-    today_orders = [o for o in orders if o["date"] == today_str]
+    today_orders = [o for o in orders if str(o.get("date", "")) == today_str]
     
     total_rev = sum(o["price"] for o in today_orders)
     total_count = len(today_orders)
@@ -344,17 +377,18 @@ def get_main_menu_text(chat_id):
     text += "📝 *ملخص الأقسام اليوم:*\n"
     
     if today_orders:
-        conn = get_db_conn()
-        cursor = conn.cursor()
-        cursor.execute("""
+        # Get department breakdown from DB
+        rows = db_execute("""
             SELECT department, COUNT(*), SUM(price)
             FROM orders
             WHERE chat_id = ? AND date = ?
             GROUP BY department
-        """, (chat_id, today_str))
-        rows = cursor.fetchall()
+        """, (chat_id, today_str), fetchall=True)
         
-        for dept, count, subtotal in rows:
+        for row in rows:
+            dept = row["department"]
+            count = row["COUNT(*)"]
+            subtotal = row["SUM(price)"]
             text += f"• {dept}: {count} طلب ({subtotal}ج)\n"
     else:
         text += "لا توجد طلبات حتى الآن\n"
@@ -377,9 +411,8 @@ def get_reports_menu_markup():
 def clean_chat(chat_id, master_msg_id):
     if not master_msg_id:
         return
-    
     try:
-        for offset in range(1, 15):
+        for offset in range(1, 20):
             try:
                 bot.delete_message(chat_id, master_msg_id + offset)
             except:
@@ -397,13 +430,13 @@ def clean_chat(chat_id, master_msg_id):
 def handle_callback(call):
     chat_id = call.message.chat.id
     msg_id = call.message.message_id
-    data = get_user_state(chat_id)
     
     try:
         bot.answer_callback_query(call.id)
     except:
         pass
     
+    data = get_user_state(chat_id)
     master_msg_id = data.get("master_msg_id")
     if not master_msg_id or master_msg_id != msg_id:
         update_user_state(chat_id, master_msg_id=msg_id)
@@ -458,7 +491,7 @@ def handle_callback(call):
     elif call.data == "rep_today":
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         orders = get_user_orders(chat_id)
-        today_orders = [o for o in orders if o["date"] == today_str]
+        today_orders = [o for o in orders if str(o.get("date", "")) == today_str]
         
         total_rev = sum(o["price"] for o in today_orders)
         
@@ -482,7 +515,14 @@ def handle_callback(call):
         month_start = datetime.date(today.year, today.month, 1)
         
         orders = get_user_orders(chat_id)
-        month_orders = [o for o in orders if datetime.datetime.strptime(o["date"], "%Y-%m-%d").date() >= month_start]
+        month_orders = []
+        for o in orders:
+            try:
+                order_date = datetime.datetime.strptime(str(o["date"]), "%Y-%m-%d").date()
+                if order_date >= month_start:
+                    month_orders.append(o)
+            except:
+                continue
         
         total_rev = sum(o["price"] for o in month_orders)
         
@@ -576,42 +616,49 @@ def start_handler(message):
 
 @bot.message_handler(commands=['restore'])
 def restore_handler(message):
-    """Handle /restore command — fetch all records from Google Sheets, rebuild SQLite, update master message, clean chat"""
+    """
+    Handle /restore command:
+    1. Delete /restore message immediately
+    2. Show loading on master message
+    3. Fetch ALL records from Google Sheets
+    4. Rebuild SQLite with restored data
+    5. Force refresh and update master message with actual restored data
+    """
     chat_id = message.chat.id
     
-    # Step 1: Delete the /restore command immediately to keep chat clean
+    # Step 1: Delete /restore command
     try:
         bot.delete_message(chat_id, message.message_id)
     except Exception as e:
-        print(f"⚠️ Could not delete /restore message: {e}")
+        print(f"⚠️ Could not delete /restore: {e}")
     
     data = get_user_state(chat_id)
     master_msg_id = data.get("master_msg_id")
     
-    # Step 2: Show loading state on master message
+    # Step 2: Show loading state
     if master_msg_id:
         try:
             bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=master_msg_id,
-                text="🔄 *جاري استعادة البيانات...*\n\n⏳ جاري الاتصال بـ Google Sheets...",
+                text="🔄 *جاري استعادة البيانات...*\n\n⏳ جاري الاتصال بـ Google Sheets والمزامنة...",
                 reply_markup=None
             )
         except:
             pass
     
-    # Step 3: Restore data from Google Sheets (all records, or filter by chat_id if you want user-specific)
-    # Using chat_id=None restores ALL records (recommended if multiple users share the same sheet)
-    # Use chat_id=chat_id for user-specific restore only
-    restored_count, restore_msg = restore_orders_from_sheets(chat_id=None)
+    # Step 3 & 4: Restore from Google Sheets (restore ALL records, filter by chat_id for display)
+    restored_count, restore_msg = restore_orders_from_sheets(target_chat_id=chat_id)
     
-    # Step 4: Update master message with restored data (main menu with fresh stats)
+    # Step 5: FORCE REFRESH - Get fresh data from DB (not cache)
+    # The db_execute function always opens fresh connections, so data is guaranteed fresh
     text = get_main_menu_text(chat_id)
     markup = get_departments_markup()
     
-    # Prepend restore status to the main menu text
+    # Prepend restore status
     full_text = f"📥 *حالة الاستعادة*\n{restore_msg}\n\n{text}"
     
+    # Update master message with restored data
     if master_msg_id:
         try:
             bot.edit_message_text(
@@ -622,7 +669,8 @@ def restore_handler(message):
             )
             update_user_state(chat_id, state="main_menu", clear_pending=True)
         except Exception as e:
-            # If edit fails, send new master message
+            print(f"⚠️ Could not edit master message: {e}")
+            # Fallback: send new master message
             msg = bot.send_message(chat_id, full_text, reply_markup=markup)
             update_user_state(chat_id, state="main_menu", master_msg_id=msg.message_id)
             clean_chat(chat_id, msg.message_id)
@@ -633,7 +681,7 @@ def restore_handler(message):
 
 @bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'audio', 'sticker', 'voice', 'location', 'contact'])
 def handle_all_messages(message):
-    """Delete ANY message from user immediately — keep chat absolutely clean"""
+    """Delete ANY message from user immediately"""
     try:
         bot.delete_message(message.chat.id, message.message_id)
     except:
@@ -667,8 +715,5 @@ if __name__ == '__main__':
     
     fetch_services_from_google_sheets()
     
-    # Optional: auto-restore on startup (uncomment if you want this)
-    # restore_orders_from_sheets()
-    
-    print("✅ Bot is running — Single Message + Async Sheets + /restore command")
+    print("✅ Bot is running — Thread-safe DB + Auto-restore + Single Message")
     bot.infinity_polling()
