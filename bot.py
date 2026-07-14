@@ -102,6 +102,108 @@ def db_execute(query, params=(), fetch=False, fetchall=False, commit=True):
         finally:
             conn.close()
 
+# --- Date/Time Parsing Helpers ---
+def parse_sheet_date(date_val):
+    """
+    Parse date from Google Sheets which can be:
+    - Date object (JS Date string like "Tue Jul 14 2026...")
+    - String "2026-07-14"
+    - String "7/14/2026"
+    - String "14-07-2026"
+    Returns: "YYYY-MM-DD" string or today's date if unparseable
+    """
+    if not date_val:
+        return datetime.date.today().strftime("%Y-%m-%d")
+    
+    date_str = str(date_val).strip()
+    
+    # If it's a JS Date string like "Tue Jul 14 2026 00:00:00 GMT+0000"
+    # Extract the date parts
+    import re
+    
+    # Try to match JS Date format: "Tue Jul 14 2026 00:00:00 GMT+0000"
+    js_date_match = re.search(r'([A-Za-z]{3})\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})', date_str)
+    if js_date_match:
+        month_map = {
+            'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+            'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12
+        }
+        try:
+            month = month_map[js_date_match.group(2)]
+            day = int(js_date_match.group(3))
+            year = int(js_date_match.group(4))
+            return f"{year:04d}-{month:02d}-{day:02d}"
+        except:
+            pass
+    
+    # Try standard formats
+    formats = [
+        "%Y-%m-%d",      # 2026-07-14
+        "%d-%m-%Y",      # 14-07-2026
+        "%m/%d/%Y",      # 7/14/2026
+        "%d/%m/%Y",      # 14/7/2026
+        "%Y/%m/%d",      # 2026/7/14
+    ]
+    
+    for fmt in formats:
+        try:
+            parsed = datetime.datetime.strptime(date_str, fmt)
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    
+    # Fallback: try to extract YYYY-MM-DD from any string
+    iso_match = re.search(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', date_str)
+    if iso_match:
+        year, month, day = iso_match.groups()
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    
+    # Ultimate fallback
+    print(f"⚠️ Could not parse date: '{date_str}', using today")
+    return datetime.date.today().strftime("%Y-%m-%d")
+
+def parse_sheet_time(time_val):
+    """
+    Parse time from Google Sheets which can be:
+    - Date object (JS Date string like "Sat Dec 30 1899 13:44:21 GMT-0016")
+    - String "13:44:21"
+    - String "13:44"
+    Returns: "HH:MM:SS" string or current time if unparseable
+    """
+    if not time_val:
+        return datetime.datetime.now().strftime("%H:%M:%S")
+    
+    time_str = str(time_val).strip()
+    import re
+    
+    # If it's a JS Date string with time like "Sat Dec 30 1899 13:44:21 GMT-0016"
+    # Extract HH:MM:SS
+    time_match = re.search(r'(\d{1,2}):(\d{2}):(\d{2})', time_str)
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2))
+        second = int(time_match.group(3))
+        return f"{hour:02d}:{minute:02d}:{second:02d}"
+    
+    # Try standard formats
+    formats = [
+        "%H:%M:%S",      # 13:44:21
+        "%H:%M",         # 13:44
+        "%I:%M:%S %p",   # 01:44:21 PM
+        "%I:%M %p",      # 01:44 PM
+    ]
+    
+    for fmt in formats:
+        try:
+            parsed = datetime.datetime.strptime(time_str, fmt)
+            return parsed.strftime("%H:%M:%S")
+        except ValueError:
+            continue
+    
+    # Ultimate fallback
+    print(f"⚠️ Could not parse time: '{time_str}', using now")
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
 # --- Google Sheets Integration ---
 def fetch_services_from_google_sheets():
     global SERVICES_CACHE, CACHE_TIMESTAMP
@@ -141,14 +243,13 @@ def fetch_orders_from_google_sheets():
 def restore_orders_from_sheets(target_chat_id=None):
     """
     Restore orders from Google Sheets into SQLite.
-    Uses direct DB connection (not thread-local pool) to avoid isolation issues.
+    Handles Date objects from Sheets properly.
     """
     orders = fetch_orders_from_google_sheets()
     if not orders:
         return 0, "❌ لا توجد بيانات في Google Sheets"
     
-    # Use the same db_execute function for consistency
-    # First, clear existing orders for this user (or all if target_chat_id is None)
+    # Clear existing orders
     if target_chat_id:
         db_execute("DELETE FROM orders WHERE chat_id = ?", (target_chat_id,))
     else:
@@ -160,19 +261,15 @@ def restore_orders_from_sheets(target_chat_id=None):
     
     for order in orders:
         try:
-            # Parse chatId - handle string, int, float, scientific notation
+            # Parse chatId
             raw_chat_id = order.get("chatId", order.get("id", "0"))
             if raw_chat_id is None:
                 raw_chat_id = "0"
-            # Convert to string and clean
             chat_id_str = str(raw_chat_id).strip()
-            # Remove .0 suffix and scientific notation artifacts
             chat_id_str = chat_id_str.replace('.0', '').replace('e+', '').replace('E+', '')
-            # Remove any non-digit characters
             chat_id_str = ''.join(c for c in chat_id_str if c.isdigit() or c == '-')
             order_chat_id = int(chat_id_str) if chat_id_str else 0
             
-            # Skip if filtering by user and doesn't match
             if target_chat_id and order_chat_id != target_chat_id:
                 continue
             
@@ -180,38 +277,24 @@ def restore_orders_from_sheets(target_chat_id=None):
                 skipped += 1
                 continue
             
-            # Parse other fields with fallbacks
             order_id_user = int(order.get("num", 0))
             department = str(order.get("department", "")).strip()
             service = str(order.get("service", "")).strip()
             price = int(float(order.get("price", 0)))
             
-            # Date handling - normalize various formats
-            date_raw = str(order.get("date", "")).strip()
-            if not date_raw:
-                date_raw = datetime.date.today().strftime("%Y-%m-%d")
-            # Ensure YYYY-MM-DD format
-            try:
-                # Try parsing various formats
-                for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d"):
-                    try:
-                        parsed = datetime.datetime.strptime(date_raw, fmt)
-                        date_raw = parsed.strftime("%Y-%m-%d")
-                        break
-                    except ValueError:
-                        continue
-            except:
-                pass
+            # CRITICAL FIX: Use robust date/time parsing for Date objects from Sheets
+            date_raw = order.get("date", "")
+            time_raw = order.get("time", "")
             
-            time_raw = str(order.get("time", "")).strip()
-            if not time_raw:
-                time_raw = datetime.datetime.now().strftime("%H:%M:%S")
+            date_str = parse_sheet_date(date_raw)
+            time_str = parse_sheet_time(time_raw)
             
-            # Insert using db_execute for consistency
+            print(f"📝 Parsed: date='{date_raw}' -> '{date_str}', time='{time_raw}' -> '{time_str}'")
+            
             db_execute('''
                 INSERT INTO orders (chat_id, order_id_user, department, service, price, time, date)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (order_chat_id, order_id_user, department, service, price, time_raw, date_raw))
+            ''', (order_chat_id, order_id_user, department, service, price, time_str, date_str))
             
             restored_count += 1
             
@@ -377,9 +460,8 @@ def get_main_menu_text(chat_id):
     text += "📝 *ملخص الأقسام اليوم:*\n"
     
     if today_orders:
-        # Get department breakdown from DB
         rows = db_execute("""
-            SELECT department, COUNT(*), SUM(price)
+            SELECT department, COUNT(*) as cnt, SUM(price) as total
             FROM orders
             WHERE chat_id = ? AND date = ?
             GROUP BY department
@@ -387,8 +469,8 @@ def get_main_menu_text(chat_id):
         
         for row in rows:
             dept = row["department"]
-            count = row["COUNT(*)"]
-            subtotal = row["SUM(price)"]
+            count = row["cnt"]
+            subtotal = row["total"]
             text += f"• {dept}: {count} طلب ({subtotal}ج)\n"
     else:
         text += "لا توجد طلبات حتى الآن\n"
@@ -621,8 +703,8 @@ def restore_handler(message):
     1. Delete /restore message immediately
     2. Show loading on master message
     3. Fetch ALL records from Google Sheets
-    4. Rebuild SQLite with restored data
-    5. Force refresh and update master message with actual restored data
+    4. Rebuild SQLite with restored data (with proper Date parsing)
+    5. Update master message with actual restored data
     """
     chat_id = message.chat.id
     
@@ -647,18 +729,15 @@ def restore_handler(message):
         except:
             pass
     
-    # Step 3 & 4: Restore from Google Sheets (restore ALL records, filter by chat_id for display)
+    # Step 3 & 4: Restore from Google Sheets
     restored_count, restore_msg = restore_orders_from_sheets(target_chat_id=chat_id)
     
-    # Step 5: FORCE REFRESH - Get fresh data from DB (not cache)
-    # The db_execute function always opens fresh connections, so data is guaranteed fresh
+    # Step 5: Get fresh data and update master message
     text = get_main_menu_text(chat_id)
     markup = get_departments_markup()
     
-    # Prepend restore status
     full_text = f"📥 *حالة الاستعادة*\n{restore_msg}\n\n{text}"
     
-    # Update master message with restored data
     if master_msg_id:
         try:
             bot.edit_message_text(
@@ -669,8 +748,7 @@ def restore_handler(message):
             )
             update_user_state(chat_id, state="main_menu", clear_pending=True)
         except Exception as e:
-            print(f"⚠️ Could not edit master message: {e}")
-            # Fallback: send new master message
+            print(f"⚠️ Could not edit master: {e}")
             msg = bot.send_message(chat_id, full_text, reply_markup=markup)
             update_user_state(chat_id, state="main_menu", master_msg_id=msg.message_id)
             clean_chat(chat_id, msg.message_id)
@@ -715,5 +793,5 @@ if __name__ == '__main__':
     
     fetch_services_from_google_sheets()
     
-    print("✅ Bot is running — Thread-safe DB + Auto-restore + Single Message")
+    print("✅ Bot is running — Date-safe restore + Single Message")
     bot.infinity_polling()
