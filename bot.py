@@ -69,7 +69,6 @@ def init_db():
             )
         ''')
         
-        # Add indexes for speed
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_chat_date ON orders(chat_id, date)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_orders_chat_id ON orders(chat_id)')
         
@@ -87,7 +86,6 @@ def get_db_conn():
 
 # --- Google Sheets Integration ---
 def fetch_services_from_google_sheets():
-    """Fetch services from Google Sheets via Apps Script"""
     global SERVICES_CACHE, CACHE_TIMESTAMP
     
     current_time = time.time()
@@ -109,61 +107,81 @@ def fetch_services_from_google_sheets():
         return SERVICES_CACHE
 
 def fetch_orders_from_google_sheets():
-    """Fetch ALL orders from Google Sheets for restore"""
     try:
-        # Call Apps Script with ?action=getOrders to get all orders
         url = f"{GOOGLE_APPS_SCRIPT_URL}?action=getOrders"
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
         
+        print(f"📥 Raw restore data sample: {data[:2] if data else 'EMPTY'}...")
+        
         if isinstance(data, list):
-            print(f"✅ Restored {len(data)} orders from Google Sheets")
+            print(f"✅ Fetched {len(data)} orders from Google Sheets")
             return data
         return []
     except Exception as e:
         print(f"❌ Error fetching orders from Google Sheets: {e}")
         return []
 
-def restore_orders_from_sheets():
-    """Restore all orders from Google Sheets into SQLite on startup"""
+def restore_orders_from_sheets(chat_id=None):
+    """Restore all orders from Google Sheets into SQLite. If chat_id provided, restore only that user's orders."""
     orders = fetch_orders_from_google_sheets()
     if not orders:
-        print("ℹ️ No orders to restore from Google Sheets")
-        return
+        return 0, "لا توجد بيانات للاستعادة"
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     
-    # Clear existing orders to avoid duplicates
-    cursor.execute("DELETE FROM orders")
+    # Clear existing orders (optionally filter by chat_id for targeted restore)
+    if chat_id:
+        cursor.execute("DELETE FROM orders WHERE chat_id = ?", (chat_id,))
+    else:
+        cursor.execute("DELETE FROM orders")
     
     restored_count = 0
+    skipped = 0
+    
     for order in orders:
         try:
-            chat_id = int(order.get("chatId", 0))
+            raw_chat_id = str(order.get("chatId", "0")).replace('.0', '').strip()
+            order_chat_id = int(raw_chat_id) if raw_chat_id else 0
+            
+            # If restoring for specific user, skip others
+            if chat_id and order_chat_id != chat_id:
+                continue
+                
+            if order_chat_id == 0:
+                skipped += 1
+                continue
+            
             order_id_user = int(order.get("num", 0))
-            department = order.get("department", "")
-            service = order.get("service", "")
+            department = str(order.get("department", ""))
+            service = str(order.get("service", ""))
             price = int(order.get("price", 0))
-            date_str = order.get("date", "")
-            time_str = order.get("time", "")
+            date_str = str(order.get("date", ""))
+            time_str = str(order.get("time", ""))
             
             cursor.execute('''
                 INSERT INTO orders (chat_id, order_id_user, department, service, price, time, date)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (chat_id, order_id_user, department, service, price, time_str, date_str))
+            ''', (order_chat_id, order_id_user, department, service, price, time_str, date_str))
             restored_count += 1
         except Exception as e:
             print(f"⚠️ Skipped invalid order row: {e}")
+            skipped += 1
             continue
     
     conn.commit()
     conn.close()
+    
+    msg = f"✅ تم استعادة *{restored_count}* طلب"
+    if skipped > 0:
+        msg += f"\n⚠️ تم تخطي *{skipped}* سجل غير صالح"
+    
     print(f"✅ Restored {restored_count} orders into SQLite")
+    return restored_count, msg
 
 def _async_log_to_sheets(department, service, price, chat_id):
-    """Background thread logging — NEVER blocks user"""
     try:
         now = datetime.datetime.now()
         payload = {
@@ -180,7 +198,6 @@ def _async_log_to_sheets(department, service, price, chat_id):
         print(f"❌ Async Sheets log failed: {e}")
 
 def log_order_to_google_sheets(department, service, price, chat_id):
-    """Fire-and-forget async logging"""
     executor.submit(_async_log_to_sheets, department, service, price, chat_id)
 
 # --- Helper Functions ---
@@ -238,7 +255,6 @@ def update_user_state(chat_id, state=None, pending_order=None, pending_departmen
     conn.commit()
 
 def record_order(chat_id, department, service, price):
-    """Record order — SQLite only, Sheets is async"""
     now = datetime.datetime.now()
     
     conn = get_db_conn()
@@ -253,7 +269,6 @@ def record_order(chat_id, department, service, price):
     ''', (chat_id, next_id, department, service, price, now.strftime("%H:%M:%S"), now.strftime("%Y-%m-%d")))
     conn.commit()
     
-    # Async to Google Sheets — NO WAIT
     log_order_to_google_sheets(department, service, price, chat_id)
     
     return {
@@ -360,7 +375,6 @@ def get_reports_menu_markup():
     return markup
 
 def clean_chat(chat_id, master_msg_id):
-    """Delete all messages except master message"""
     if not master_msg_id:
         return
     
@@ -377,24 +391,6 @@ def clean_chat(chat_id, master_msg_id):
                 pass
     except:
         pass
-
-def ensure_master_message(chat_id, text, markup=None):
-    """Always returns the single master message ID"""
-    data = get_user_state(chat_id)
-    master_msg_id = data.get("master_msg_id")
-    
-    if master_msg_id:
-        try:
-            bot.edit_message_text(chat_id=chat_id, message_id=master_msg_id, text=text, reply_markup=markup)
-            return master_msg_id
-        except Exception as e:
-            pass
-    
-    msg = bot.send_message(chat_id, text, reply_markup=markup)
-    update_user_state(chat_id, master_msg_id=msg.message_id)
-    clean_chat(chat_id, msg.message_id)
-    
-    return msg.message_id
 
 # --- Callback Handlers ---
 @bot.callback_query_handler(func=lambda call: True)
@@ -542,7 +538,6 @@ def handle_callback(call):
         )
 
 def auto_return_to_main(chat_id, msg_id):
-    """Auto-return to main menu"""
     try:
         text = get_main_menu_text(chat_id)
         markup = get_departments_markup()
@@ -579,6 +574,63 @@ def start_handler(message):
     update_user_state(chat_id, state="main_menu", master_msg_id=msg.message_id)
     clean_chat(chat_id, msg.message_id)
 
+@bot.message_handler(commands=['restore'])
+def restore_handler(message):
+    """Handle /restore command — fetch all records from Google Sheets, rebuild SQLite, update master message, clean chat"""
+    chat_id = message.chat.id
+    
+    # Step 1: Delete the /restore command immediately to keep chat clean
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception as e:
+        print(f"⚠️ Could not delete /restore message: {e}")
+    
+    data = get_user_state(chat_id)
+    master_msg_id = data.get("master_msg_id")
+    
+    # Step 2: Show loading state on master message
+    if master_msg_id:
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=master_msg_id,
+                text="🔄 *جاري استعادة البيانات...*\n\n⏳ جاري الاتصال بـ Google Sheets...",
+                reply_markup=None
+            )
+        except:
+            pass
+    
+    # Step 3: Restore data from Google Sheets (all records, or filter by chat_id if you want user-specific)
+    # Using chat_id=None restores ALL records (recommended if multiple users share the same sheet)
+    # Use chat_id=chat_id for user-specific restore only
+    restored_count, restore_msg = restore_orders_from_sheets(chat_id=None)
+    
+    # Step 4: Update master message with restored data (main menu with fresh stats)
+    text = get_main_menu_text(chat_id)
+    markup = get_departments_markup()
+    
+    # Prepend restore status to the main menu text
+    full_text = f"📥 *حالة الاستعادة*\n{restore_msg}\n\n{text}"
+    
+    if master_msg_id:
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=master_msg_id,
+                text=full_text,
+                reply_markup=markup
+            )
+            update_user_state(chat_id, state="main_menu", clear_pending=True)
+        except Exception as e:
+            # If edit fails, send new master message
+            msg = bot.send_message(chat_id, full_text, reply_markup=markup)
+            update_user_state(chat_id, state="main_menu", master_msg_id=msg.message_id)
+            clean_chat(chat_id, msg.message_id)
+    else:
+        msg = bot.send_message(chat_id, full_text, reply_markup=markup)
+        update_user_state(chat_id, state="main_menu", master_msg_id=msg.message_id)
+        clean_chat(chat_id, msg.message_id)
+
 @bot.message_handler(content_types=['text', 'photo', 'video', 'document', 'audio', 'sticker', 'voice', 'location', 'contact'])
 def handle_all_messages(message):
     """Delete ANY message from user immediately — keep chat absolutely clean"""
@@ -613,11 +665,10 @@ threading.Thread(target=run_health_server, daemon=True).start()
 if __name__ == '__main__':
     print("🚀 Bot is starting...")
     
-    # Pre-fetch services on startup
     fetch_services_from_google_sheets()
     
-    # RESTORE orders from Google Sheets on startup
-    restore_orders_from_sheets()
+    # Optional: auto-restore on startup (uncomment if you want this)
+    # restore_orders_from_sheets()
     
-    print("✅ Bot is running — Single Message Mode + Async Sheets + Auto-Restore")
+    print("✅ Bot is running — Single Message + Async Sheets + /restore command")
     bot.infinity_polling()
