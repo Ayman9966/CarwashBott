@@ -709,6 +709,27 @@ def handle_all_messages(message):
     except Exception: pass
 
 # --- Start Bot ---
+
+# --- Health Check Server (for Render Web Service) ---
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'OK')
+    def log_message(self, format, *args):
+        pass
+
+def run_health_server():
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    server.serve_forever()
+
+# Start health check in background thread
+threading.Thread(target=run_health_server, daemon=True).start()
+
 if __name__ == '__main__':
     print("Bot is running...")
     bot.infinity_polling()
