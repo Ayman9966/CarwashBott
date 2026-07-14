@@ -709,15 +709,17 @@ def handle_callbacks(call):
 
     elif call.data == "backup_menu":
         text = "💾 *إدارة النسخ الاحتياطي والضبط*\n\nتحكم بالبيانات المخزنة أو توجه إلى لوحة التحكم بالأقسام والأسعار:"
-        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.add(types.InlineKeyboardButton("⚙️ إعدادات الأقسام والأسعار", callback_data="settings_main"))
         markup.add(
-            types.InlineKeyboardButton("⚙️ إعدادات الأقسام والأسعار", callback_data="settings_main"),
-            types.InlineKeyboardButton("➕ إنشاء قسم جديد تماماً", callback_data="add_category_trigger"),
-            types.InlineKeyboardButton("📤 تحميل البيانات فورا (CSV)", callback_data="export_csv"),
-            types.InlineKeyboardButton("📥 استعادة البيانات (رفع CSV)", callback_data="import_csv_trigger"),
-            types.InlineKeyboardButton("🗑️ حذف قسم", callback_data="remove_category_trigger"),
-            types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu")
+            types.InlineKeyboardButton("➕ قسم جديد", callback_data="add_category_trigger"),
+            types.InlineKeyboardButton("🗑️ حذف قسم", callback_data="remove_category_trigger")
         )
+        markup.add(
+            types.InlineKeyboardButton("📤 تصدير CSV", callback_data="export_csv"),
+            types.InlineKeyboardButton("📥 استيراد CSV", callback_data="import_csv_trigger")
+        )
+        markup.add(types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
     elif call.data == "settings_main":
@@ -732,8 +734,8 @@ def handle_callbacks(call):
         for cat in cats:
             markup.add(types.InlineKeyboardButton(f"إدارة: {cat[2]} {cat[1]}", callback_data=f"setcat_{cat[0]}"))
             
-        markup.add(types.InlineKeyboardButton("🔙 رجوع للخلف", callback_data="backup_menu"))
         markup.add(types.InlineKeyboardButton("🗑️ حذف خدمة", callback_data="remove_service_trigger"))
+        markup.add(types.InlineKeyboardButton("🔙 رجوع للنسخ الاحتياطي", callback_data="backup_menu"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
 
     elif call.data == "add_category_trigger":
