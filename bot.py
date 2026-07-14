@@ -744,16 +744,12 @@ def handle_callbacks(call):
             text = "❌ لا توجد أقسام لحذفها."
             markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="backup_menu"))
             bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-            i += 1
-            continue
             
         for cat in cats:
             markup.add(types.InlineKeyboardButton(f"🗑️ {cat[2]} {cat[1]}", callback_data=f"delcat_{cat[0]}"))
             
         markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="backup_menu"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-        i += 1
-        continue
     elif call.data.startswith("setcat_"):
         cat_id = int(call.data.split("_")[1])
         update_user_state(chat_id, selected_cat_id=cat_id)
@@ -806,16 +802,12 @@ def handle_callbacks(call):
             text = "❌ لا توجد خدمات في هذا القسم لحذفها."
             markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_main"))
             bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-            i += 1
-            continue
             
         for srv in services:
             markup.add(types.InlineKeyboardButton(f"🗑️ {srv[1]} — {srv[2]}ج", callback_data=f"delsrv_{srv[0]}"))
             
         markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="settings_main"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-        i += 1
-        continue
     elif call.data == "rep_today":
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         orders = get_user_orders(chat_id)
@@ -893,8 +885,6 @@ def handle_callbacks(call):
         markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="backup_menu"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
         scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
-        i += 1
-        continue
     elif call.data == "confirm_delete":
         orders = get_user_orders(chat_id)
         if not orders:
@@ -941,8 +931,6 @@ def handle_callbacks(call):
         markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_main"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
         scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
-        i += 1
-        continue
     elif call.data == "export_csv":
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         orders = get_user_orders(chat_id)
