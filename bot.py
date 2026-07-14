@@ -4,6 +4,7 @@ import csv
 import sqlite3
 import os
 import time
+import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from telebot import TeleBot, types
@@ -12,18 +13,23 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # --- Configuration & Initialization ---
 API_TOKEN = os.environ.get('BOT_TOKEN')
 ADMIN_CHAT_ID = int(os.environ.get('ADMIN_CHAT_ID', '0'))
+GOOGLE_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxFZNCyFFnNgT4UrklSZ6jjHA_m0mCzpOFOf81OMIPHRDAhOY3N_ANxuKi236SRTCK2Ng/exec"
 
 if not API_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required!")
 
 bot = TeleBot(API_TOKEN, parse_mode='Markdown')
-
 scheduler = BackgroundScheduler()
 scheduler.start()
 
 DB_FILE = 'wash_and_scan.db'
 
-# --- Database Initialization & Migration ---
+# --- Cache for Google Sheets data ---
+SERVICES_CACHE = []
+CACHE_TIMESTAMP = 0
+CACHE_VALIDITY = 300  # 5 minutes
+
+# --- Database Initialization ---
 def init_db():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
@@ -33,6 +39,7 @@ def init_db():
                 chat_id INTEGER PRIMARY KEY,
                 state TEXT DEFAULT 'main_menu',
                 pending_service TEXT,
+                pending_department TEXT,
                 pending_price INTEGER,
                 last_bot_msg_id INTEGER
             )
@@ -40,35 +47,15 @@ def init_db():
         
         cursor.execute("PRAGMA table_info(user_states)")
         columns = [column[1] for column in cursor.fetchall()]
-        if 'selected_cat_id' not in columns:
-            cursor.execute("ALTER TABLE user_states ADD COLUMN selected_cat_id INTEGER")
-            print("Added selected_cat_id to user_states")
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS categories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE,
-                icon TEXT
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS services (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                category_id INTEGER,
-                name TEXT,
-                price INTEGER,
-                is_active INTEGER DEFAULT 1,
-                FOREIGN KEY(category_id) REFERENCES categories(id)
-            )
-        ''')
+        if 'pending_department' not in columns:
+            cursor.execute("ALTER TABLE user_states ADD COLUMN pending_department TEXT")
         
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER,
                 order_id_user INTEGER,
-                category_id INTEGER,
+                department TEXT,
                 service TEXT,
                 price INTEGER,
                 time TEXT,
@@ -76,96 +63,187 @@ def init_db():
             )
         ''')
         
-        cursor.execute("PRAGMA table_info(orders)")
-        order_columns = [column[1] for column in cursor.fetchall()]
-        if 'category_id' not in order_columns:
-            cursor.execute("ALTER TABLE orders ADD COLUMN category_id INTEGER")
-            print("Added category_id to orders")
-            
         conn.commit()
 
 init_db()
 
-# --- Helper Functions ---
+# --- Google Sheets Integration ---
+def fetch_services_from_google_sheets():
+    """Fetch services from Google Sheets via Apps Script"""
+    global SERVICES_CACHE, CACHE_TIMESTAMP
+    
+    current_time = time.time()
+    
+    # Return cache if valid
+    if SERVICES_CACHE and (current_time - CACHE_TIMESTAMP) < CACHE_VALIDITY:
+        return SERVICES_CACHE
+    
+    try:
+        response = requests.get(GOOGLE_APPS_SCRIPT_URL, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        
+        SERVICES_CACHE = data
+        CACHE_TIMESTAMP = current_time
+        print(f"✅ Loaded {len(data)} services from Google Sheets")
+        return data
+    except Exception as e:
+        print(f"❌ Error fetching from Google Sheets: {e}")
+        return SERVICES_CACHE  # Return cache on error
 
+def log_order_to_google_sheets(department, service, price, chat_id):
+    """Log order to Google Sheets via Apps Script"""
+    try:
+        now = datetime.datetime.now()
+        payload = {
+            "department": department,
+            "service": service,
+            "price": price,
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M:%S"),
+            "chatId": chat_id
+        }
+        
+        response = requests.post(GOOGLE_APPS_SCRIPT_URL, json=payload, timeout=5)
+        response.raise_for_status()
+        result = response.json()
+        
+        if result.get("status") == "success":
+            return result.get("num")
+    except Exception as e:
+        print(f"❌ Error logging to Google Sheets: {e}")
+    
+    return None
+
+# --- Helper Functions ---
 def get_user_state(chat_id):
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT state, pending_service, pending_price, last_bot_msg_id, selected_cat_id FROM user_states WHERE chat_id = ?", (chat_id,))
+        cursor.execute("SELECT state, pending_service, pending_department, pending_price, last_bot_msg_id FROM user_states WHERE chat_id = ?", (chat_id,))
         row = cursor.fetchone()
         
         if not row:
             cursor.execute("INSERT INTO user_states (chat_id) VALUES (?)", (chat_id,))
             conn.commit()
-            return {"state": "main_menu", "pending_order": None, "last_bot_msg_id": None, "selected_cat_id": None}
+            return {
+                "state": "main_menu",
+                "pending_order": None,
+                "pending_department": None,
+                "last_bot_msg_id": None
+            }
         
-        pending_order = {"service": row[1], "price": row[2]} if row[1] else None
+        pending_order = {
+            "service": row[1],
+            "department": row[2],
+            "price": row[3]
+        } if row[1] else None
+        
         return {
             "state": row[0],
             "pending_order": pending_order,
-            "last_bot_msg_id": row[3],
-            "selected_cat_id": row[4]
+            "pending_department": row[2],
+            "last_bot_msg_id": row[4]
         }
 
-def update_user_state(chat_id, state=None, pending_order=None, last_bot_msg_id=None, selected_cat_id=None, clear_pending=False):
+def update_user_state(chat_id, state=None, pending_order=None, pending_department=None, last_bot_msg_id=None, clear_pending=False):
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         if state:
             cursor.execute("UPDATE user_states SET state = ? WHERE chat_id = ?", (state, chat_id))
         if last_bot_msg_id is not None:
             cursor.execute("UPDATE user_states SET last_bot_msg_id = ? WHERE chat_id = ?", (last_bot_msg_id, chat_id))
-        if selected_cat_id is not None:
-            cursor.execute("UPDATE user_states SET selected_cat_id = ? WHERE chat_id = ?", (selected_cat_id, chat_id))
+        if pending_department:
+            cursor.execute("UPDATE user_states SET pending_department = ? WHERE chat_id = ?", (pending_department, chat_id))
         if pending_order:
             cursor.execute("UPDATE user_states SET pending_service = ?, pending_price = ? WHERE chat_id = ?", 
                            (pending_order["service"], pending_order["price"], chat_id))
         if clear_pending:
-            cursor.execute("UPDATE user_states SET pending_service = NULL, pending_price = NULL, selected_cat_id = NULL WHERE chat_id = ?", (chat_id,))
+            cursor.execute("UPDATE user_states SET pending_service = NULL, pending_price = NULL, pending_department = NULL WHERE chat_id = ?", (chat_id,))
         conn.commit()
+
+def record_order(chat_id, department, service, price):
+    """Record order to both SQLite and Google Sheets"""
+    now = datetime.datetime.now()
+    
+    # Get next order ID from SQLite
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(order_id_user) FROM orders WHERE chat_id = ?", (chat_id,))
+        last_id = cursor.fetchone()[0]
+        next_id = (last_id or 0) + 1
+        
+        # Log to SQLite
+        cursor.execute('''
+            INSERT INTO orders (chat_id, order_id_user, department, service, price, time, date)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (chat_id, next_id, department, service, price, now.strftime("%H:%M:%S"), now.strftime("%Y-%m-%d")))
+        conn.commit()
+    
+    # Log to Google Sheets (async-like, don't block on failure)
+    log_order_to_google_sheets(department, service, price, chat_id)
+    
+    return {
+        "id": next_id,
+        "department": department,
+        "service": service,
+        "price": price,
+        "time": now.strftime("%H:%M:%S"),
+        "date": now.strftime("%Y-%m-%d")
+    }
 
 def get_user_orders(chat_id):
     with sqlite3.connect(DB_FILE) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT order_id_user AS id, category_id, service, price, time, date FROM orders WHERE chat_id = ? ORDER BY id ASC", (chat_id,))
+        cursor.execute("SELECT id, order_id_user, department, service, price, time, date FROM orders WHERE chat_id = ? ORDER BY id ASC", (chat_id,))
         rows = cursor.fetchall()
         return [dict(r) for r in rows]
 
-def get_main_menu_markup():
-    markup = types.InlineKeyboardMarkup(row_width=2)
+def get_departments_markup():
+    """Create inline keyboard for departments"""
+    services = fetch_services_from_google_sheets()
     
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, name, icon FROM categories")
-        cats = cursor.fetchall()
-        
+    # Group by department
+    departments = {}
+    for item in services:
+        dept = item.get("department", "Unknown")
+        if dept not in departments:
+            departments[dept] = []
+        departments[dept].append(item)
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = []
-    for cat in cats:
-        buttons.append(types.InlineKeyboardButton(f"{cat[2]} {cat[1]}", callback_data=f"cat_show_{cat[0]}"))
-        
+    
+    for dept in sorted(departments.keys()):
+        buttons.append(types.InlineKeyboardButton(f"📦 {dept}", callback_data=f"dept_{dept}"))
+    
     markup.add(*buttons)
     
-    b3 = types.InlineKeyboardButton("📊 التقارير والإحصائيات", callback_data="menu_reports")
-    b4 = types.InlineKeyboardButton("💾 النسخ الاحتياطي والضبط", callback_data="backup_menu")
-    b5 = types.InlineKeyboardButton("🗑️ حذف آخر طلب", callback_data="confirm_delete")
+    # Add reports button
+    markup.add(types.InlineKeyboardButton("📊 التقارير", callback_data="menu_reports"))
     
-    markup.add(b3, b4)
-    markup.add(b5)
     return markup
 
-def get_reports_menu_markup():
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    b1 = types.InlineKeyboardButton("📆 تقرير اليوم", callback_data="rep_today")
-    b2 = types.InlineKeyboardButton("📈 تقرير الشهر", callback_data="rep_month")
-    b3 = types.InlineKeyboardButton("📅 الشهور السابقة", callback_data="rep_all_months")
-    b4 = types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu")
+def get_services_by_department_markup(department):
+    """Create inline keyboard for services in a department"""
+    services = fetch_services_from_google_sheets()
     
-    markup.add(b1, b2)
-    markup.add(b3)
-    markup.add(b4)
+    dept_services = [s for s in services if s.get("department") == department]
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    
+    for svc in dept_services:
+        svc_name = svc.get("service", "Unknown")
+        price = svc.get("price", 0)
+        button_text = f"{svc_name} • {price}ج"
+        button = types.InlineKeyboardButton(button_text, callback_data=f"service_{department}_{svc_name}_{price}")
+        markup.add(button)
+    
+    markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
     return markup
 
 def get_main_menu_text(chat_id):
+    """Generate main menu overview"""
     today_str = datetime.date.today().strftime("%Y-%m-%d")
     orders = get_user_orders(chat_id)
     today_orders = [o for o in orders if o["date"] == today_str]
@@ -178,997 +256,211 @@ def get_main_menu_text(chat_id):
     text += "━━━━━━━━━━━━━━━━━━\n"
     text += f"💰 إجمالي الإيرادات: *{total_rev} ج*\n"
     text += f"📦 عدد الطلبات: *{total_count}*\n\n"
-    
     text += "📝 *ملخص الأقسام اليوم:*\n"
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT c.icon, c.name, COUNT(o.id), SUM(o.price)
-            FROM orders o
-            JOIN categories c ON o.category_id = c.id
-            WHERE o.chat_id = ? AND o.date = ?
-            GROUP BY c.id
-        """, (chat_id, today_str))
-        cat_summary = cursor.fetchall()
-        
-    if not cat_summary:
-        text += "  لا توجد مبيعات في الأقسام اليوم بعد.\n\n"
-    else:
-        for row in cat_summary:
-            text += f"  {row[0]} {row[1]} — عدد {row[2]} — *{row[3]} ج*\n"
-        text += "\n"
-        
-    text += "🕐 *آخر 5 تسجيلات:*\n"
-    if not orders:
-        text += "  مفيش تسجيلات\n"
-    else:
-        for o in orders[-5:][::-1]:
-            text += f"  `#{o['id']}` {o['service']} — *{o['price']}ج* ({o['date']})\n"
+    
+    if today_orders:
+        with sqlite3.connect(DB_FILE) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT department, COUNT(*), SUM(price)
+                FROM orders
+                WHERE chat_id = ? AND date = ?
+                GROUP BY department
+            """, (chat_id, today_str))
+            rows = cursor.fetchall()
             
-    text += "\n📌 *اختار الإجراء أو القسم:*"
+            for dept, count, subtotal in rows:
+                text += f"• {dept}: {count} طلب ({subtotal}ج)\n"
+    else:
+        text += "لا توجد طلبات حتى الآن\n"
+    
+    text += "\n➕ *إضافة طلب جديد:*"
     return text
 
-def record_order(chat_id, category_id, service, price):
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT COUNT(*) FROM orders WHERE chat_id = ?", (chat_id,))
-        count = cursor.fetchone()[0]
-        next_order_id = count + 1
-        
-        now_time = datetime.datetime.now().strftime("%H:%M")
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
-        
-        cursor.execute('''
-            INSERT INTO orders (chat_id, order_id_user, category_id, service, price, time, date)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (chat_id, next_order_id, category_id, service, int(price), now_time, today_str))
-        conn.commit()
+def get_reports_menu_markup():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    b1 = types.InlineKeyboardButton("📆 اليوم", callback_data="rep_today")
+    b2 = types.InlineKeyboardButton("📈 الشهر", callback_data="rep_month")
+    b3 = types.InlineKeyboardButton("📤 تصدير CSV", callback_data="export_csv")
+    b4 = types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")
     
-    update_user_state(chat_id, state="main_menu", clear_pending=True)
-    return {
-        "id": next_order_id,
-        "service": service,
-        "price": int(price),
-        "time": now_time,
-        "date": today_str
-    }
+    markup.add(b1, b2)
+    markup.add(b3)
+    markup.add(b4)
+    return markup
 
-def auto_return_to_main(chat_id, message_id):
+def ensure_master_message(chat_id, text, markup=None):
+    """Ensure there's a master message to edit"""
     try:
-        bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=get_main_menu_text(chat_id),
-            reply_markup=get_main_menu_markup()
-        )
-    except Exception:
-        pass
-
-def price_timeout_handler(chat_id, message_id, category_id):
-    data = get_user_state(chat_id)
-    if data["state"] == "awaiting_price" and data["pending_order"] and data["last_bot_msg_id"] == message_id:
-        po = data["pending_order"]
-        order = record_order(chat_id, category_id, po["service"], po["price"])
-        
-        text = f"✅ *تم التسجيل تلقائياً #{order['id']}*\n\n"
-        text += f"🛠️ {order['service']}\n"
-        text += f"💰 {order['price']}ج\n"
-        text += f"🕐 {order['time']}\n\n"
-        text += "⏳ رجوع تلقائي للقائمة..."
-        
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
-        
-        try:
-            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup)
-            scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, message_id])
-        except Exception:
-            pass
-
-def normalize_date(date_str):
-    date_str = date_str.strip().replace('/', '-')
-    formats = ('%Y-%m-%d', '%d-%m-%Y', '%d-%m-%y')
-    for fmt in formats:
-        try:
-            return datetime.datetime.strptime(date_str, fmt).strftime('%Y-%m-%d')
-        except ValueError:
-            continue
-    return date_str
-
-def auto_daily_backup():
-    today_str = datetime.date.today().strftime("%Y-%m-%d")
-    current_month = datetime.date.today().strftime("%Y-%m")
-    current_year = datetime.date.today().strftime("%Y")
-    
-    wb = Workbook()
-    
-    # --- Styles ---
-    header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
-    header_font = Font(color="FFFFFF", bold=True, size=12)
-    subheader_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
-    subheader_font = Font(color="FFFFFF", bold=True, size=11)
-    title_font = Font(size=16, bold=True, color="1F4E78")
-    money_font = Font(size=11, color="006100")
-    money_fill = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
-    warning_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
-    warning_font = Font(color="9C0006")
-    thin_border = Border(
-        left=Side(style="thin"), right=Side(style="thin"),
-        top=Side(style="thin"), bottom=Side(style="thin")
-    )
-    center_align = Alignment(horizontal="center", vertical="center")
-    right_align = Alignment(horizontal="right", vertical="center")
-    
-    # Fetch all data
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT order_id_user, service, price, time, date, chat_id, category_id FROM orders ORDER BY date DESC, time DESC")
-        all_orders = cursor.fetchall()
-        cursor.execute("SELECT id, name, icon FROM categories")
-        categories = {row[0]: f"{row[2]} {row[1]}" for row in cursor.fetchall()}
-        cursor.execute("SELECT id, name, category_id FROM services")
-        services_map = {row[0]: row[1] for row in cursor.fetchall()}
-    
-    today_orders = [o for o in all_orders if o[4] == today_str]
-    month_orders = [o for o in all_orders if o[4].startswith(current_month)]
-    year_orders = [o for o in all_orders if o[4].startswith(current_year)]
-    total_day_rev = sum(o[2] for o in today_orders)
-    total_month_rev = sum(o[2] for o in month_orders)
-    total_year_rev = sum(o[2] for o in year_orders)
-    total_all_rev = sum(o[2] for o in all_orders)
-    
-    # ============================================
-    # SHEET 1: DASHBOARD
-    # ============================================
-    ws_dash = wb.active
-    ws_dash.title = "Dashboard"
-    
-    ws_dash.merge_cells("A1:F1")
-    ws_dash["A1"] = f"Wash & Scan - Daily Report ({today_str})"
-    ws_dash["A1"].font = title_font
-    ws_dash["A1"].alignment = Alignment(horizontal="center", vertical="center")
-    ws_dash.row_dimensions[1].height = 30
-    
-    kpi_data = [
-        ["Today Revenue", f"{total_day_rev} EGP", len(today_orders), "orders"],
-        ["Month Revenue", f"{total_month_rev} EGP", len(month_orders), "orders"],
-        ["Year Revenue", f"{total_year_rev} EGP", len(year_orders), "orders"],
-        ["All Time Revenue", f"{total_all_rev} EGP", len(all_orders), "orders"]
-    ]
-    
-    ws_dash["A3"] = "Period"
-    ws_dash["B3"] = "Revenue"
-    ws_dash["C3"] = "Count"
-    ws_dash["D3"] = "Unit"
-    for col in ["A", "B", "C", "D"]:
-        ws_dash[f"{col}3"].fill = header_fill
-        ws_dash[f"{col}3"].font = header_font
-        ws_dash[f"{col}3"].alignment = center_align
-        ws_dash[f"{col}3"].border = thin_border
-    
-    for idx, row in enumerate(kpi_data, start=4):
-        ws_dash[f"A{idx}"] = row[0]
-        ws_dash[f"B{idx}"] = row[1]
-        ws_dash[f"C{idx}"] = row[2]
-        ws_dash[f"D{idx}"] = row[3]
-        for col in ["A", "B", "C", "D"]:
-            ws_dash[f"{col}{idx}"].border = thin_border
-            ws_dash[f"{col}{idx}"].alignment = center_align
-        ws_dash[f"B{idx}"].fill = money_fill
-        ws_dash[f"B{idx}"].font = money_font
-    
-    ws_dash["A9"] = "Category Breakdown - Today"
-    ws_dash["A9"].font = subheader_font
-    ws_dash["A9"].fill = subheader_fill
-    ws_dash.merge_cells("A9:D9")
-    
-    ws_dash["A10"] = "Category"
-    ws_dash["B10"] = "Orders"
-    ws_dash["C10"] = "Revenue"
-    ws_dash["D10"] = "% Share"
-    for col in ["A", "B", "C", "D"]:
-        ws_dash[f"{col}10"].fill = header_fill
-        ws_dash[f"{col}10"].font = header_font
-        ws_dash[f"{col}10"].alignment = center_align
-        ws_dash[f"{col}10"].border = thin_border
-    
-    cat_breakdown = {}
-    for o in today_orders:
-        cat_name = categories.get(o[6], "Unknown")
-        if cat_name not in cat_breakdown:
-            cat_breakdown[cat_name] = {"count": 0, "revenue": 0}
-        cat_breakdown[cat_name]["count"] += 1
-        cat_breakdown[cat_name]["revenue"] += o[2]
-    
-    row_idx = 11
-    for cat_name, stats in sorted(cat_breakdown.items(), key=lambda x: x[1]["revenue"], reverse=True):
-        pct = (stats["revenue"] / total_day_rev * 100) if total_day_rev > 0 else 0
-        ws_dash[f"A{row_idx}"] = cat_name
-        ws_dash[f"B{row_idx}"] = stats["count"]
-        ws_dash[f"C{row_idx}"] = stats["revenue"]
-        ws_dash[f"D{row_idx}"] = f"{pct:.1f}%"
-        for col in ["A", "B", "C", "D"]:
-            ws_dash[f"{col}{row_idx}"].border = thin_border
-            ws_dash[f"{col}{row_idx}"].alignment = center_align
-        ws_dash[f"C{row_idx}"].fill = money_fill
-        row_idx += 1
-    
-    ws_dash.column_dimensions["A"].width = 22
-    ws_dash.column_dimensions["B"].width = 18
-    ws_dash.column_dimensions["C"].width = 12
-    ws_dash.column_dimensions["D"].width = 12
-    
-    # ============================================
-    # SHEET 2: ALL ORDERS
-    # ============================================
-    ws_orders = wb.create_sheet("All Orders")
-    
-    headers = ["#", "Service", "Category", "Price (EGP)", "Time", "Date", "Order ID"]
-    for col_idx, header in enumerate(headers, 1):
-        cell = ws_orders.cell(row=1, column=col_idx, value=header)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center_align
-        cell.border = thin_border
-    
-    for row_idx, order in enumerate(all_orders, start=2):
-        ws_orders.cell(row=row_idx, column=1, value=row_idx-1)
-        ws_orders.cell(row=row_idx, column=2, value=order[1])
-        ws_orders.cell(row=row_idx, column=3, value=categories.get(order[6], "Unknown"))
-        ws_orders.cell(row=row_idx, column=4, value=order[2])
-        ws_orders.cell(row=row_idx, column=5, value=order[3])
-        ws_orders.cell(row=row_idx, column=6, value=order[4])
-        ws_orders.cell(row=row_idx, column=7, value=order[0])
-        for col in range(1, 8):
-            ws_orders.cell(row=row_idx, column=col).border = thin_border
-            ws_orders.cell(row=row_idx, column=col).alignment = center_align
-        ws_orders.cell(row=row_idx, column=4).fill = money_fill
-        ws_orders.cell(row=row_idx, column=4).font = money_font
-    
-    total_row = len(all_orders) + 2
-    ws_orders.cell(row=total_row, column=1, value="TOTAL")
-    ws_orders.cell(row=total_row, column=4, value=total_all_rev)
-    for col in [1, 4]:
-        ws_orders.cell(row=total_row, column=col).font = Font(bold=True, size=12)
-        ws_orders.cell(row=total_row, column=col).fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
-        ws_orders.cell(row=total_row, column=col).border = thin_border
-    
-    ws_orders.column_dimensions["A"].width = 6
-    ws_orders.column_dimensions["B"].width = 28
-    ws_orders.column_dimensions["C"].width = 22
-    ws_orders.column_dimensions["D"].width = 14
-    ws_orders.column_dimensions["E"].width = 10
-    ws_orders.column_dimensions["F"].width = 12
-    ws_orders.column_dimensions["G"].width = 10
-    
-    # ============================================
-    # SHEET 3: TODAY ORDERS
-    # ============================================
-    ws_today = wb.create_sheet("Today Orders")
-    
-    ws_today.merge_cells("A1:F1")
-    ws_today["A1"] = f"Orders for {today_str}"
-    ws_today["A1"].font = title_font
-    ws_today["A1"].alignment = center_align
-    ws_today.row_dimensions[1].height = 25
-    
-    headers_today = ["#", "Service", "Category", "Price", "Time", "Order ID"]
-    for col_idx, header in enumerate(headers_today, 1):
-        cell = ws_today.cell(row=3, column=col_idx, value=header)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center_align
-        cell.border = thin_border
-    
-    for row_idx, order in enumerate(today_orders, start=4):
-        ws_today.cell(row=row_idx, column=1, value=row_idx-3)
-        ws_today.cell(row=row_idx, column=2, value=order[1])
-        ws_today.cell(row=row_idx, column=3, value=categories.get(order[6], "Unknown"))
-        ws_today.cell(row=row_idx, column=4, value=order[2])
-        ws_today.cell(row=row_idx, column=5, value=order[3])
-        ws_today.cell(row=row_idx, column=6, value=order[0])
-        for col in range(1, 7):
-            ws_today.cell(row=row_idx, column=col).border = thin_border
-            ws_today.cell(row=row_idx, column=col).alignment = center_align
-        ws_today.cell(row=row_idx, column=4).fill = money_fill
-    
-    t_total = len(today_orders) + 4
-    ws_today.cell(row=t_total, column=1, value="TOTAL")
-    ws_today.cell(row=t_total, column=4, value=total_day_rev)
-    for col in [1, 4]:
-        ws_today.cell(row=t_total, column=col).font = Font(bold=True, size=12)
-        ws_today.cell(row=t_total, column=col).fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
-        ws_today.cell(row=t_total, column=col).border = thin_border
-    
-    ws_today.column_dimensions["A"].width = 6
-    ws_today.column_dimensions["B"].width = 28
-    ws_today.column_dimensions["C"].width = 22
-    ws_today.column_dimensions["D"].width = 14
-    ws_today.column_dimensions["E"].width = 10
-    ws_today.column_dimensions["F"].width = 10
-    
-    # ============================================
-    # SHEET 4: MONTHLY SUMMARY
-    # ============================================
-    ws_month = wb.create_sheet("Monthly Summary")
-    
-    ws_month.merge_cells("A1:E1")
-    ws_month["A1"] = f"Monthly Summary - {current_year}"
-    ws_month["A1"].font = title_font
-    ws_month["A1"].alignment = center_align
-    
-    month_headers = ["Month", "Total Orders", "Revenue (EGP)", "Avg Order", "Trend"]
-    for col_idx, header in enumerate(month_headers, 1):
-        cell = ws_month.cell(row=3, column=col_idx, value=header)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center_align
-        cell.border = thin_border
-    
-    monthly_data = {}
-    for o in all_orders:
-        m = o[4][:7]
-        if m not in monthly_data:
-            monthly_data[m] = {"count": 0, "revenue": 0}
-        monthly_data[m]["count"] += 1
-        monthly_data[m]["revenue"] += o[2]
-    
-    row_idx = 4
-    prev_rev = 0
-    for month in sorted(monthly_data.keys(), reverse=True):
-        stats = monthly_data[month]
-        avg = stats["revenue"] // stats["count"] if stats["count"] > 0 else 0
-        trend = "UP" if stats["revenue"] > prev_rev else "DOWN" if stats["revenue"] < prev_rev else "FLAT"
-        prev_rev = stats["revenue"]
-        ws_month.cell(row=row_idx, column=1, value=month)
-        ws_month.cell(row=row_idx, column=2, value=stats["count"])
-        ws_month.cell(row=row_idx, column=3, value=stats["revenue"])
-        ws_month.cell(row=row_idx, column=4, value=avg)
-        ws_month.cell(row=row_idx, column=5, value=trend)
-        for col in range(1, 6):
-            ws_month.cell(row=row_idx, column=col).border = thin_border
-            ws_month.cell(row=row_idx, column=col).alignment = center_align
-        ws_month.cell(row=row_idx, column=3).fill = money_fill
-        if trend == "UP":
-            ws_month.cell(row=row_idx, column=5).fill = money_fill
-        elif trend == "DOWN":
-            ws_month.cell(row=row_idx, column=5).fill = warning_fill
-            ws_month.cell(row=row_idx, column=5).font = warning_font
-        row_idx += 1
-    
-    ws_month.column_dimensions["A"].width = 12
-    ws_month.column_dimensions["B"].width = 14
-    ws_month.column_dimensions["C"].width = 16
-    ws_month.column_dimensions["D"].width = 12
-    ws_month.column_dimensions["E"].width = 10
-    
-    # ============================================
-    # SHEET 5: TOP SERVICES
-    # ============================================
-    ws_top = wb.create_sheet("Top Services")
-    
-    ws_top.merge_cells("A1:D1")
-    ws_top["A1"] = "Top Performing Services - All Time"
-    ws_top["A1"].font = title_font
-    ws_top["A1"].alignment = center_align
-    
-    top_headers = ["Rank", "Service", "Total Orders", "Total Revenue"]
-    for col_idx, header in enumerate(top_headers, 1):
-        cell = ws_top.cell(row=3, column=col_idx, value=header)
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = center_align
-        cell.border = thin_border
-    
-    service_stats = {}
-    for o in all_orders:
-        svc = o[1]
-        if svc not in service_stats:
-            service_stats[svc] = {"count": 0, "revenue": 0}
-        service_stats[svc]["count"] += 1
-        service_stats[svc]["revenue"] += o[2]
-    
-    sorted_services = sorted(service_stats.items(), key=lambda x: x[1]["revenue"], reverse=True)
-    for rank, (svc, stats) in enumerate(sorted_services[:20], start=1):
-        row = rank + 3
-        ws_top.cell(row=row, column=1, value=rank)
-        ws_top.cell(row=row, column=2, value=svc)
-        ws_top.cell(row=row, column=3, value=stats["count"])
-        ws_top.cell(row=row, column=4, value=stats["revenue"])
-        for col in range(1, 5):
-            ws_top.cell(row=row, column=col).border = thin_border
-            ws_top.cell(row=row, column=col).alignment = center_align
-        ws_top.cell(row=row, column=4).fill = money_fill
-        if rank <= 3:
-            ws_top.cell(row=row, column=1).fill = PatternFill(start_color="FFD966", end_color="FFD966", fill_type="solid")
-    
-    ws_top.column_dimensions["A"].width = 8
-    ws_top.column_dimensions["B"].width = 30
-    ws_top.column_dimensions["C"].width = 14
-    ws_top.column_dimensions["D"].width = 16
-    
-    # ============================================
-    # SAVE & SEND
-    # ============================================
-    bio = io.BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    bio.name = f"Daily_Report_{today_str}.xlsx"
-    
-    try:
-        report_text = f"📊 *Daily Professional Report*\n"
-        report_text += f"📅 Date: `{today_str}`\n"
-        report_text += "━━━━━━━━━━━━━━━━━━\n"
-        report_text += f"💰 Today: *{total_day_rev} EGP* ({len(today_orders)} orders)\n"
-        report_text += f"📈 Month: *{total_month_rev} EGP* ({len(month_orders)} orders)\n"
-        report_text += f"📊 Year: *{total_year_rev} EGP* ({len(year_orders)} orders)\n"
-        report_text += f"🏆 All Time: *{total_all_rev} EGP* ({len(all_orders)} orders)\n\n"
-        report_text += "📎 Attached: 5-sheet Excel workbook with full analytics"
-        
-        bot.send_document(ADMIN_CHAT_ID, bio, caption=report_text)
-        print(f"Daily backup sent: {bio.name}")
+        bot.send_message(chat_id, text, reply_markup=markup)
     except Exception as e:
-        print(f"Failed to send automated backup: {e}")
+        print(f"Error sending master message: {e}")
 
-scheduler.add_job(auto_daily_backup, 'cron', hour=23, minute=59)
-
-# --- Helper: Clean Chat & Ensure Master Message ---
-def ensure_master_message(chat_id, text, markup, state=None, clear_pending=False):
-    """
-    Deletes all old bot messages in the chat and sends ONE fresh master message.
-    Stores the new message ID as the master message.
-    """
-    # 1. Delete old master message if exists
-    data = get_user_state(chat_id)
-    old_msg_id = data.get("last_bot_msg_id")
-    
-    if old_msg_id:
-        try:
-            bot.delete_message(chat_id, old_msg_id)
-        except Exception:
-            pass  # Message already deleted or too old
-    
-    # 2. Send new master message
-    sent = bot.send_message(chat_id, text, reply_markup=markup)
-    
-    # 3. Update state with new master message ID
-    update_user_state(chat_id, state=state, last_bot_msg_id=sent.message_id, clear_pending=clear_pending)
-    
-    return sent.message_id
-
-def edit_master_message(chat_id, message_id, text, markup=None):
-    """
-    Edits the existing master message instead of sending a new one.
-    If editing fails, falls back to ensure_master_message.
-    """
-    try:
-        if markup:
-            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup)
-        else:
-            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
-        return message_id
-    except Exception:
-        # If edit fails (e.g., message too old), create a fresh master message
-        return ensure_master_message(chat_id, text, markup)
-
-# --- Command Handlers ---
-@bot.message_handler(commands=['start'])
-def start_cmd(message):
-    chat_id = message.chat.id
-    # Delete the /start command message from user
-    try:
-        bot.delete_message(chat_id, message.message_id)
-    except Exception:
-        pass
-    
-    # Send fresh master message (deletes any old ones)
-    ensure_master_message(
-        chat_id, 
-        get_main_menu_text(chat_id), 
-        get_main_menu_markup(),
-        state="main_menu",
-        clear_pending=True
-    )
-
-# --- Callback Query Handlers ---
+# --- Callback Handlers ---
 @bot.callback_query_handler(func=lambda call: True)
-def handle_callbacks(call):
+def handle_callback(call):
     chat_id = call.message.chat.id
     msg_id = call.message.message_id
     data = get_user_state(chat_id)
     
     try:
         bot.answer_callback_query(call.id)
-    except Exception:
+    except:
         pass
     
+    # Main menu
     if call.data == "main_menu":
+        text = get_main_menu_text(chat_id)
+        markup = get_departments_markup()
+        update_user_state(chat_id, state="main_menu", last_bot_msg_id=msg_id, clear_pending=True)
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+    
+    # Department selection
+    elif call.data.startswith("dept_"):
+        department = call.data.replace("dept_", "")
+        text = f"📦 *{department}*\n\n🔍 اختر الخدمة:"
+        markup = get_services_by_department_markup(department)
+        update_user_state(chat_id, state="selecting_service", pending_department=department, last_bot_msg_id=msg_id)
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+    
+    # Service selection
+    elif call.data.startswith("service_"):
+        parts = call.data.split("_", 3)
+        department = parts[1]
+        service = parts[2]
+        price = int(parts[3])
+        
+        order = record_order(chat_id, department, service, price)
+        
+        text = f"✅ *تم التسجيل #{order['id']}*\n\n"
+        text += f"📦 {order['department']}\n"
+        text += f"🛠️ {order['service']}\n"
+        text += f"💰 {order['price']}ج\n\n"
+        text += "⏳ رجوع تلقائي..."
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
+        
         update_user_state(chat_id, state="main_menu", clear_pending=True)
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=get_main_menu_text(chat_id), reply_markup=get_main_menu_markup())
-
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+        
+        # Auto return to main menu after 2 seconds
+        scheduler.add_job(
+            auto_return_to_main,
+            'date',
+            run_date=datetime.datetime.now() + datetime.timedelta(seconds=2),
+            args=[chat_id, msg_id]
+        )
+    
+    # Reports menu
     elif call.data == "menu_reports":
-        update_user_state(chat_id, state="reports_menu")
-        text = "📊 *مطبخ التقارير والإحصائيات*\n\nاختار نوع التقرير المطلوب استعراضه:"
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=get_reports_menu_markup())
-
-    elif call.data.startswith("cat_show_"):
-        cat_id = int(call.data.split("_")[2])
-        update_user_state(chat_id, state="service_list", selected_cat_id=cat_id)
-        
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
-            cat_info = cursor.fetchone()
-            cursor.execute("SELECT id, name, price FROM services WHERE category_id = ? AND is_active = 1", (cat_id,))
-            services = cursor.fetchall()
-            
-        title = f"{cat_info[1]} {cat_info[0]}"
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        
-        for srv in services:
-            markup.add(types.InlineKeyboardButton(f"{srv[1]} — {srv[2]}ج", callback_data=f"srv_{srv[0]}"))
-            
-        markup.add(types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu"))
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=f"📍 قسم: *{title}*\n\nاضغط لتسجيل الإجراء مباشرة:", reply_markup=markup)
-
-    elif call.data.startswith("srv_"):
-        srv_id = int(call.data.split("_")[1])
-        cat_id = data["selected_cat_id"]
-        
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, price FROM services WHERE id = ?", (srv_id,))
-            srv_row = cursor.fetchone()
-        
-        if not srv_row:
-            bot.answer_callback_query(call.id, "❌ الخدمة دي مش موجودة، ممكن تكون اتحذفت.", show_alert=True)
-            return
-        
-        service_name, default_price = srv_row[0], srv_row[1]
-        
-        update_user_state(chat_id, state="awaiting_price", pending_order={"service": service_name, "price": default_price}, last_bot_msg_id=msg_id)
-        
-        text = f"💰 *تأكيد السعر*\n\n"
-        text += f"🛠️ {service_name}\n"
-        text += f"السعر الافتراضي: *{default_price}ج*\n\n"
-        text += "✅ اضغط تأكيد أو اكتب سعر جديد في الشات خلال 10 ثواني..."
-        
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            types.InlineKeyboardButton(f"✅ تأكيد ({default_price}ج)", callback_data="confirm_default"),
-            types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu")
-        )
+        text = "📊 *التقارير والإحصائيات*\n\nاختر نطاق التقرير:"
+        markup = get_reports_menu_markup()
+        update_user_state(chat_id, state="reports_menu", last_bot_msg_id=msg_id)
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-        scheduler.add_job(price_timeout_handler, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=10), args=[chat_id, msg_id, cat_id])
-
-    elif call.data == "confirm_default":
-        if data["state"] == "awaiting_price" and data["pending_order"]:
-            po = data["pending_order"]
-            cat_id = data["selected_cat_id"]
-            order = record_order(chat_id, cat_id, po["service"], po["price"])
-            
-            text = f"✅ *تم التسجيل #{order['id']}*\n\n"
-            text += f"🛠️ {order['service']}\n"
-            text += f"💰 {order['price']}ج\n"
-            text += f"🕐 {order['time']}\n\n"
-            text += "⏳ رجوع تلقائي للقائمة..."
-            
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
-            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-            scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
-
-    elif call.data == "backup_menu":
-        text = "💾 *إدارة النسخ الاحتياطي والضبط*\n\nتحكم بالبيانات المخزنة أو توجه إلى لوحة التحكم بالأقسام والأسعار:"
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(types.InlineKeyboardButton("⚙️ إعدادات الأقسام والأسعار", callback_data="settings_main"))
-        markup.add(
-            types.InlineKeyboardButton("➕ قسم جديد", callback_data="add_category_trigger"),
-            types.InlineKeyboardButton("🗑️ حذف قسم", callback_data="remove_category_trigger")
-        )
-        markup.add(
-            types.InlineKeyboardButton("📤 تصدير CSV", callback_data="export_csv"),
-            types.InlineKeyboardButton("📥 استيراد CSV", callback_data="import_csv_trigger")
-        )
-        markup.add(types.InlineKeyboardButton("🔙 رجوع للقائمة الرئيسية", callback_data="main_menu"))
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-
-    elif call.data == "settings_main":
-        text = "⚙️ *لوحة تحكم الأقسام والخدمات*\n\nاختار القسم لتعديل أسعاره أو إضافة خدمة جديدة داخله:"
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, name, icon FROM categories")
-            cats = cursor.fetchall()
-            
-        for cat in cats:
-            markup.add(types.InlineKeyboardButton(f"إدارة: {cat[2]} {cat[1]}", callback_data=f"setcat_{cat[0]}"))
-            
-        markup.add(types.InlineKeyboardButton("🗑️ حذف خدمة", callback_data="remove_service_trigger"))
-        markup.add(types.InlineKeyboardButton("🔙 رجوع للنسخ الاحتياطي", callback_data="backup_menu"))
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-
-    elif call.data == "add_category_trigger":
-        update_user_state(chat_id, state="awaiting_new_category", last_bot_msg_id=msg_id)
-        text = "➕ *إنشاء قسم جديد*\n\nاكتب اسم القسم والـ emoji المفضل في رسالة واحدة مثل هذا المثال:\n\n`غسيل سيارات — 🚗`"
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="backup_menu"))
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-
-
-    elif call.data == "remove_category_trigger":
-        update_user_state(chat_id, state="awaiting_remove_category", last_bot_msg_id=msg_id)
-        text = "🗑️ *حذف قسم*\n\nاختار القسم المراد حذفه:"
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, name, icon FROM categories")
-            cats = cursor.fetchall()
-            
-        if not cats:
-            text = "❌ لا توجد أقسام لحذفها."
-            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="backup_menu"))
-            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-            return
-            
-        for cat in cats:
-            markup.add(types.InlineKeyboardButton(f"🗑️ {cat[2]} {cat[1]}", callback_data=f"delcat_{cat[0]}"))
-            
-        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="backup_menu"))
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-    elif call.data.startswith("setcat_"):
-        cat_id = int(call.data.split("_")[1])
-        update_user_state(chat_id, selected_cat_id=cat_id)
-        
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
-            cat_info = cursor.fetchone()
-            cursor.execute("SELECT id, name, price FROM services WHERE category_id = ? AND is_active = 1", (cat_id,))
-            services = cursor.fetchall()
-            
-        text = f"⚙️ *تعديل قسم: {cat_info[1]} {cat_info[0]}*\n\n"
-        text += "الخدمات الحالية المسجلة:\n"
-        if not services:
-            text += "  لا توجد خدمات في هذا القسم بعد.\n"
-        for s in services:
-            text += f"• {s[1]} — {s[2]}ج\n"
-            
-        text += "\n➕ لإضافة خدمة جديدة لهذا القسم اضغط على الزر بالأسفل."
-        
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        markup.add(
-            types.InlineKeyboardButton("➕ إضافة خدمة / إجراء جديد", callback_data="add_service_trigger"),
-            types.InlineKeyboardButton("🔙 رجوع للضبط", callback_data="settings_main")
-        )
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-
-    elif call.data == "add_service_trigger":
-        update_user_state(chat_id, state="awaiting_new_service_name", last_bot_msg_id=msg_id)
-        text = "✍️ *إضافة خدمة جديدة*\n\nاكتب اسم الخدمة والسعر في رسالة واحدة بالشات بهذا الشكل تماماً:\n\n`غسيل شامل — 300`\n\n⚠️ تأكد من وضع الشرطة المائلة `—` بين الاسم والسعر."
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="settings_main"))
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-
-
-    elif call.data == "remove_service_trigger":
-        cat_id = data["selected_cat_id"]
-        
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
-            cat_info = cursor.fetchone()
-            cursor.execute("SELECT id, name, price FROM services WHERE category_id = ? AND is_active = 1", (cat_id,))
-            services = cursor.fetchall()
-            
-        text = f"🗑️ *حذف خدمة من قسم: {cat_info[1]} {cat_info[0]}*\n\nاختار الخدمة المراد حذفها:"
-        markup = types.InlineKeyboardMarkup(row_width=1)
-        
-        if not services:
-            text = "❌ لا توجد خدمات في هذا القسم لحذفها."
-            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_main"))
-            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-            return
-            
-        for srv in services:
-            markup.add(types.InlineKeyboardButton(f"🗑️ {srv[1]} — {srv[2]}ج", callback_data=f"delsrv_{srv[0]}"))
-            
-        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="settings_main"))
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+    
+    # Report - Today
     elif call.data == "rep_today":
         today_str = datetime.date.today().strftime("%Y-%m-%d")
         orders = get_user_orders(chat_id)
         today_orders = [o for o in orders if o["date"] == today_str]
+        
         total_rev = sum(o["price"] for o in today_orders)
         
-        text = f"📆 *تقرير اليوم بالتفصيل*\n"
+        text = f"📆 *تقرير اليوم*\n"
         text += f"📅 {today_str}\n"
         text += "━━━━━━━━━━━━━━━━━━\n"
-        text += f"💰 الإجمالي: *{total_rev} ج*\n"
-        text += f"📦 الطلبات: *{len(today_orders)}*\n\n"
-        text += "📝 *التفاصيل:*\n"
+        text += f"📦 عدد الطلبات: *{len(today_orders)}*\n"
+        text += f"💰 إجمالي الإيرادات: *{total_rev} ج*\n\n"
         
-        if not today_orders:
-            text += "  مفيش طلبات مسجلة اليوم حتى الآن."
-        else:
+        if today_orders:
+            text += "*تفاصيل الطلبات:*\n"
             for o in today_orders:
-                text += f"  `#{o['id']}` {o['service']} — *{o['price']}ج* ({o['time']})\n"
-                
+                text += f"#{o['order_id_user']} • {o['service']} ({o['department']}) • {o['price']}ج • {o['time']}\n"
+        
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 رجوع للتقارير", callback_data="menu_reports"))
+        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="menu_reports"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-
+    
+    # Report - Month
     elif call.data == "rep_month":
-        current_month = datetime.date.today().strftime("%Y-%m")
+        today = datetime.date.today()
+        month_start = datetime.date(today.year, today.month, 1)
+        
         orders = get_user_orders(chat_id)
-        month_orders = [o for o in orders if o["date"].startswith(current_month)]
+        month_orders = [o for o in orders if datetime.datetime.strptime(o["date"], "%Y-%m-%d").date() >= month_start]
+        
         total_rev = sum(o["price"] for o in month_orders)
         
-        text = f"📈 *تقرير إحصائيات الشهر الحالي*\n"
-        text += f"📅 {current_month}\n"
+        text = f"📈 *تقرير الشهر*\n"
+        text += f"📅 {month_start.strftime('%B %Y')}\n"
         text += "━━━━━━━━━━━━━━━━━━\n"
+        text += f"📦 عدد الطلبات: *{len(month_orders)}*\n"
         text += f"💰 إجمالي الإيرادات: *{total_rev} ج*\n"
-        text += f"📦 إجمالي الطلبات: *{len(month_orders)}*\n\n"
         
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 رجوع للتقارير", callback_data="menu_reports"))
+        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="menu_reports"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-
-    elif call.data == "rep_all_months":
-        text = f"📅 *الملخص السنوي / الشهور السابقة*\n"
-        text += "━━━━━━━━━━━━━━━━━━\n"
-        orders = get_user_orders(chat_id)
-        monthly_summaries = {}
-        for o in orders:
-            month_key = o["date"][:7]
-            monthly_summaries[month_key] = monthly_summaries.get(month_key, 0) + o["price"]
-            
-        if not monthly_summaries:
-            text += "لا يوجد مبيعات مؤرشفة لشهور سابقة بعد."
-        else:
-            for m_key, m_total in sorted(monthly_summaries.items(), reverse=True):
-                text += f"📅 شهر *{m_key}* — إجمالي الإيراد: *{m_total} ج*\n"
-                
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 رجوع للتقارير", callback_data="menu_reports"))
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-
-
-    elif call.data.startswith("delcat_"):
-        cat_id = int(call.data.split("_")[1])
-        
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, icon FROM categories WHERE id = ?", (cat_id,))
-            cat_info = cursor.fetchone()
-            
-            # Soft delete: deactivate services first, then delete category
-            cursor.execute("UPDATE services SET is_active = 0 WHERE category_id = ?", (cat_id,))
-            cursor.execute("DELETE FROM categories WHERE id = ?", (cat_id,))
-            conn.commit()
-            
-        text = f"🗑️ *تم حذف القسم بنجاح!*\n\n📂 {cat_info[1]} {cat_info[0]}\n\n⏳ رجوع تلقائي..."
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="backup_menu"))
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-        scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
-    elif call.data == "confirm_delete":
-        orders = get_user_orders(chat_id)
-        if not orders:
-            bot.answer_callback_query(call.id, "مفيش طلبات عشان تحذفها!", show_alert=True)
-            return
-        
-        last_order = orders[-1]
-        text = f"🗑️ *تأكيد الحذف*\n\nهل أنت متأكد من حذف آخر طلب؟\n\n`#{last_order['id']}` {last_order['service']} — *{last_order['price']}ج*"
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("⚠️ نعم، احذف", callback_data="delete_execute"),
-            types.InlineKeyboardButton("❌ لا، تراجع", callback_data="main_menu")
-        )
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-
-    elif call.data == "delete_execute":
-        orders = get_user_orders(chat_id)
-        if orders:
-            last_order = orders[-1]
-            with sqlite3.connect(DB_FILE) as conn:
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM orders WHERE chat_id = ? AND order_id_user = ?", (chat_id, last_order["id"]))
-                conn.commit()
-            
-            text = "🗑️ تم الحذف بنجاح... رجوع تلقائي"
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
-            bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-            scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
-
-
-    elif call.data.startswith("delsrv_"):
-        srv_id = int(call.data.split("_")[1])
-        
-        with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name, price FROM services WHERE id = ?", (srv_id,))
-            srv_info = cursor.fetchone()
-            cursor.execute("UPDATE services SET is_active = 0 WHERE id = ?", (srv_id,))
-            conn.commit()
-            
-        text = f"🗑️ *تم حذف الخدمة بنجاح!*\n\n🛠️ {srv_info[0]} — {srv_info[1]}ج\n\n⏳ رجوع تلقائي..."
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="settings_main"))
-        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
-        scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, msg_id])
+    
+    # Export CSV
     elif call.data == "export_csv":
-        today_str = datetime.date.today().strftime("%Y-%m-%d")
         orders = get_user_orders(chat_id)
+        today_str = datetime.date.today().strftime("%Y-%m-%d")
+        
         csv_buffer = io.StringIO()
         csv_buffer.write('\ufeff')
         writer = csv.writer(csv_buffer)
-        writer.writerow(["رقم الطلب", "نوع الخدمة", "السعر", "الوقت", "التاريخ"])
+        writer.writerow(["رقم الطلب", "القسم", "نوع الخدمة", "السعر", "الوقت", "التاريخ"])
         for o in orders:
-            writer.writerow([o["id"], o["service"], o["price"], o["time"], o["date"]])
+            writer.writerow([o["order_id_user"], o["department"], o["service"], o["price"], o["time"], o["date"]])
+        
         csv_buffer.seek(0)
         bio = io.BytesIO(csv_buffer.getvalue().encode('utf-8'))
-        bio.name = f"تقرير_الشغل_{chat_id}_{today_str}.csv"
-        try:
-            bot.send_document(chat_id, bio, caption="📤 تم سحب النسخة بنجاح.")
-        except Exception:
-            pass
-
-    elif call.data == "import_csv_trigger":
-        update_user_state(chat_id, state="awaiting_restore_file", last_bot_msg_id=msg_id)
-        text = "📥 قم بإرسال ملف الـ CSV لاستعادة البيانات الحالية واستبدالها..."
+        bio.name = f"تقرير_{chat_id}_{today_str}.csv"
+        
+        text = "📤 جاري تصدير البيانات..."
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("❌ إلغاء", callback_data="backup_menu"))
+        markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="menu_reports"))
         bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+        
+        try:
+            bot.send_document(chat_id, bio, caption="📤 تم تصدير البيانات بنجاح!")
+        except Exception as e:
+            print(f"Error sending CSV: {e}")
 
-
-# --- Message Handling ---
-@bot.message_handler(content_types=['text', 'document'])
-def handle_all_messages(message):
-    chat_id = message.chat.id
-    data = get_user_state(chat_id)
-    target_msg_id = data["last_bot_msg_id"]
-    
-    # Delete user's message immediately to keep chat clean
+def auto_return_to_main(chat_id, msg_id):
+    """Auto-return to main menu"""
     try:
-        bot.delete_message(chat_id, message.message_id)
+        text = get_main_menu_text(chat_id)
+        markup = get_departments_markup()
+        bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=markup)
+        update_user_state(chat_id, state="main_menu")
     except Exception:
         pass
+
+# --- Message Handling ---
+@bot.message_handler(commands=['start'])
+def start_handler(message):
+    chat_id = message.chat.id
+    text = get_main_menu_text(chat_id)
+    markup = get_departments_markup()
+    msg = bot.send_message(chat_id, text, reply_markup=markup)
+    update_user_state(chat_id, state="main_menu", last_bot_msg_id=msg.message_id)
     
-    if data["state"] == "awaiting_new_category" and message.content_type == 'text':
-        text_received = message.text.strip()
-        
-        if "—" in text_received:
-            try:
-                cat_name, cat_icon = text_received.split("—")
-                cat_name = cat_name.strip()
-                cat_icon = cat_icon.strip()
-                
-                with sqlite3.connect(DB_FILE) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("INSERT INTO categories (name, icon) VALUES (?, ?)", (cat_name, cat_icon))
-                    conn.commit()
-                text = f"✅ *تم إنشاء القسم الجديد بنجاح!*\n\n📂 القسم: {cat_icon} {cat_name}\n📌 يمكنك الآن التوجه للإعدادات وإضافة خدمات له."
-            except Exception as e:
-                text = f"❌ حدث خطأ، يرجى التأكد من عدم تكرار اسم القسم.\n`{str(e)}`"
-        else:
-            text = "❌ صيغة غير صحيحة. اكتبها كالتالي: `غسيل سيارات — 🚗`"
-            
-        update_user_state(chat_id, state="main_menu")
-        # Edit master message instead of sending new one
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("⚙️ إعدادات الأقسام والأسعار", callback_data="settings_main"))
-        try:
-            bot.edit_message_text(chat_id=chat_id, message_id=target_msg_id, text=text, reply_markup=markup)
-        except Exception:
-            ensure_master_message(chat_id, text, markup)
-        return
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except:
+        pass
 
-    elif data["state"] == "awaiting_new_service_name" and message.content_type == 'text':
-        text_received = message.text.strip()
-            
-        if "—" in text_received:
-            try:
-                srv_name, srv_price = text_received.split("—")
-                srv_name = srv_name.strip()
-                srv_price = int(srv_price.strip())
-                cat_id = data["selected_cat_id"]
-                
-                if cat_id:
-                    with sqlite3.connect(DB_FILE) as conn:
-                        cursor = conn.cursor()
-                        cursor.execute("INSERT INTO services (category_id, name, price) VALUES (?, ?, ?)", (cat_id, srv_name, srv_price))
-                        conn.commit()
-                    text = f"✅ *تمت إضافة الإجراء الجديد بنجاح!*\n\n🛠️ الخدمة: {srv_name}\n💰 السعر: {srv_price}ج"
-                else:
-                    text = "❌ خطأ في تحديد القسم الحالي المسؤول."
-            except Exception as e:
-                text = f"❌ خطأ في معالجة المدخلات، تأكد من الصيغة الرقمية الصحيحة.\n`{str(e)}`"
-        else:
-            text = "❌ صيغة غير صحيحة. يجب كتابتها هكذا: `غسيل شامل — 300`."
-            
-        update_user_state(chat_id, state="main_menu")
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("⚙️ العودة للضبط", callback_data="settings_main"))
-        try:
-            bot.edit_message_text(chat_id=chat_id, message_id=target_msg_id, text=text, reply_markup=markup)
-        except Exception:
-            ensure_master_message(chat_id, text, markup)
-        return
+@bot.message_handler(content_types=['text'])
+def handle_messages(message):
+    """Handle general messages - keep chat clean"""
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except:
+        pass
 
-    elif data["state"] == "awaiting_restore_file":
-        if message.content_type == 'document' and message.document.file_name.endswith('.csv'):
-            try:
-                file_info = bot.get_file(message.document.file_id)
-                downloaded_file = bot.download_file(file_info.file_path)
-                csv_content = downloaded_file.decode('utf-8-sig', errors='ignore')
-                csv_file = io.StringIO(csv_content)
-                reader = csv.reader(csv_file)
-                header = next(reader, None)
-                
-                if not header or "نوع الخدمة" not in header or "السعر" not in header:
-                    raise ValueError("الملف المرفوع لا يطابق الهيكلية المطلوبة.")
-                
-                valid_rows = []
-                for row in reader:
-                    if len(row) >= 5:
-                        clean_date = normalize_date(row[4])
-                        valid_rows.append((chat_id, int(row[0]), 1, row[1], int(row[2]), row[3], clean_date))
-                
-                if valid_rows:
-                    with sqlite3.connect(DB_FILE) as conn:
-                        cursor = conn.cursor()
-                        cursor.execute("DELETE FROM orders WHERE chat_id = ?", (chat_id,))
-                        cursor.executemany('''
-                            INSERT INTO orders (chat_id, order_id_user, category_id, service, price, time, date)
-                            VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ''', valid_rows)
-                        conn.commit()
-                    text = f"✨ *تم استعادة البيانات لعدد {len(valid_rows)} طلب!*"
-                else:
-                    text = "❌ الملف المرفوع لا يحتوي على سجلات صالحة."
-            except Exception as e:
-                text = f"❌ *فشلت عملية الاستعادة:*\n`{str(e)}`"
-            
-            update_user_state(chat_id, state="main_menu")
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu"))
-            try:
-                bot.edit_message_text(chat_id=chat_id, message_id=target_msg_id, text=text, reply_markup=markup)
-            except Exception:
-                ensure_master_message(chat_id, text, markup)
-            return
-
-    elif data["state"] == "awaiting_price" and data["pending_order"] and message.content_type == 'text':
-        text_clean = message.text.strip()
-        if text_clean.isdigit():
-            custom_price = int(text_clean)
-            po = data["pending_order"]
-            cat_id = data["selected_cat_id"]
-            order = record_order(chat_id, cat_id, po["service"], custom_price)
-            
-            text = f"✅ *تم التسجيل #{order['id']}*\n\n🛠️ {order['service']}\n💰 {order['price']}ج\n\n⏳ رجوع تلقائي..."
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
-            
-            try:
-                bot.edit_message_text(chat_id=chat_id, message_id=target_msg_id, text=text, reply_markup=markup)
-                scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, target_msg_id])
-            except Exception:
-                ensure_master_message(chat_id, text, markup)
-                scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, target_msg_id])
-            return
-
-    # If we reach here, the message was irrelevant - just keep chat clean
-    # (user message already deleted above)
-
-# --- Start Bot ---
-
-# --- Health Check Server (for Render Web Service) ---
+# --- Health Check Server ---
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -1177,6 +469,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b'OK')
+    
     def log_message(self, format, *args):
         pass
 
@@ -1185,9 +478,15 @@ def run_health_server():
     server = HTTPServer(('0.0.0.0', port), HealthHandler)
     server.serve_forever()
 
-# Start health check in background thread
 threading.Thread(target=run_health_server, daemon=True).start()
 
+# --- Startup ---
 if __name__ == '__main__':
-    print("Bot is running...")
+    print("🚀 Bot is starting...")
+    print(f"📊 Google Apps Script URL configured")
+    
+    # Pre-fetch services on startup
+    fetch_services_from_google_sheets()
+    
+    print("✅ Bot is running...")
     bot.infinity_polling()
