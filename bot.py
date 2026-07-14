@@ -3,6 +3,7 @@ import io
 import csv
 import sqlite3
 import os
+import time
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from telebot import TeleBot, types
@@ -612,12 +613,63 @@ def auto_daily_backup():
 
 scheduler.add_job(auto_daily_backup, 'cron', hour=23, minute=59)
 
+# --- Helper: Clean Chat & Ensure Master Message ---
+def ensure_master_message(chat_id, text, markup, state=None, clear_pending=False):
+    """
+    Deletes all old bot messages in the chat and sends ONE fresh master message.
+    Stores the new message ID as the master message.
+    """
+    # 1. Delete old master message if exists
+    data = get_user_state(chat_id)
+    old_msg_id = data.get("last_bot_msg_id")
+    
+    if old_msg_id:
+        try:
+            bot.delete_message(chat_id, old_msg_id)
+        except Exception:
+            pass  # Message already deleted or too old
+    
+    # 2. Send new master message
+    sent = bot.send_message(chat_id, text, reply_markup=markup)
+    
+    # 3. Update state with new master message ID
+    update_user_state(chat_id, state=state, last_bot_msg_id=sent.message_id, clear_pending=clear_pending)
+    
+    return sent.message_id
+
+def edit_master_message(chat_id, message_id, text, markup=None):
+    """
+    Edits the existing master message instead of sending a new one.
+    If editing fails, falls back to ensure_master_message.
+    """
+    try:
+        if markup:
+            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=markup)
+        else:
+            bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+        return message_id
+    except Exception:
+        # If edit fails (e.g., message too old), create a fresh master message
+        return ensure_master_message(chat_id, text, markup)
+
 # --- Command Handlers ---
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
     chat_id = message.chat.id
-    update_user_state(chat_id, state="main_menu", clear_pending=True, last_bot_msg_id=0)
-    bot.send_message(chat_id, get_main_menu_text(chat_id), reply_markup=get_main_menu_markup())
+    # Delete the /start command message from user
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception:
+        pass
+    
+    # Send fresh master message (deletes any old ones)
+    ensure_master_message(
+        chat_id, 
+        get_main_menu_text(chat_id), 
+        get_main_menu_markup(),
+        state="main_menu",
+        clear_pending=True
+    )
 
 # --- Callback Query Handlers ---
 @bot.callback_query_handler(func=lambda call: True)
@@ -981,10 +1033,14 @@ def handle_all_messages(message):
     data = get_user_state(chat_id)
     target_msg_id = data["last_bot_msg_id"]
     
+    # Delete user's message immediately to keep chat clean
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception:
+        pass
+    
     if data["state"] == "awaiting_new_category" and message.content_type == 'text':
         text_received = message.text.strip()
-        try: bot.delete_message(chat_id, message.message_id)
-        except Exception: pass
         
         if "—" in text_received:
             try:
@@ -1003,15 +1059,17 @@ def handle_all_messages(message):
             text = "❌ صيغة غير صحيحة. اكتبها كالتالي: `غسيل سيارات — 🚗`"
             
         update_user_state(chat_id, state="main_menu")
+        # Edit master message instead of sending new one
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("⚙️ إعدادات الأقسام والأسعار", callback_data="settings_main"))
-        bot.send_message(chat_id, text, reply_markup=markup)
+        try:
+            bot.edit_message_text(chat_id=chat_id, message_id=target_msg_id, text=text, reply_markup=markup)
+        except Exception:
+            ensure_master_message(chat_id, text, markup)
         return
 
     elif data["state"] == "awaiting_new_service_name" and message.content_type == 'text':
         text_received = message.text.strip()
-        try: bot.delete_message(chat_id, message.message_id)
-        except Exception: pass
             
         if "—" in text_received:
             try:
@@ -1036,7 +1094,10 @@ def handle_all_messages(message):
         update_user_state(chat_id, state="main_menu")
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("⚙️ العودة للضبط", callback_data="settings_main"))
-        bot.send_message(chat_id, text, reply_markup=markup)
+        try:
+            bot.edit_message_text(chat_id=chat_id, message_id=target_msg_id, text=text, reply_markup=markup)
+        except Exception:
+            ensure_master_message(chat_id, text, markup)
         return
 
     elif data["state"] == "awaiting_restore_file":
@@ -1073,13 +1134,13 @@ def handle_all_messages(message):
             except Exception as e:
                 text = f"❌ *فشلت عملية الاستعادة:*\n`{str(e)}`"
             
-            try: bot.delete_message(chat_id, message.message_id)
-            except Exception: pass
-                
             update_user_state(chat_id, state="main_menu")
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("🔙 القائمة الرئيسية", callback_data="main_menu"))
-            bot.send_message(chat_id, text, reply_markup=markup)
+            try:
+                bot.edit_message_text(chat_id=chat_id, message_id=target_msg_id, text=text, reply_markup=markup)
+            except Exception:
+                ensure_master_message(chat_id, text, markup)
             return
 
     elif data["state"] == "awaiting_price" and data["pending_order"] and message.content_type == 'text':
@@ -1090,9 +1151,6 @@ def handle_all_messages(message):
             cat_id = data["selected_cat_id"]
             order = record_order(chat_id, cat_id, po["service"], custom_price)
             
-            try: bot.delete_message(chat_id, message.message_id)
-            except Exception: pass
-                
             text = f"✅ *تم التسجيل #{order['id']}*\n\n🛠️ {order['service']}\n💰 {order['price']}ج\n\n⏳ رجوع تلقائي..."
             markup = types.InlineKeyboardMarkup()
             markup.add(types.InlineKeyboardButton("🔙 رجوع", callback_data="main_menu"))
@@ -1101,12 +1159,12 @@ def handle_all_messages(message):
                 bot.edit_message_text(chat_id=chat_id, message_id=target_msg_id, text=text, reply_markup=markup)
                 scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, target_msg_id])
             except Exception:
-                sent = bot.send_message(chat_id, text, reply_markup=markup)
-                scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, sent.message_id])
+                ensure_master_message(chat_id, text, markup)
+                scheduler.add_job(auto_return_to_main, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=2), args=[chat_id, target_msg_id])
             return
 
-    try: bot.delete_message(chat_id, message.message_id)
-    except Exception: pass
+    # If we reach here, the message was irrelevant - just keep chat clean
+    # (user message already deleted above)
 
 # --- Start Bot ---
 
